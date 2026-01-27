@@ -471,6 +471,8 @@ if(ENABLE_ALL_WARNINGS)
 endif()
 
 if(VELOX_ENABLE_WAVE OR VELOX_ENABLE_CUDF)
+  # Ensure CUDA uses the same host compiler as the CMAKE_CXX_COMPILER
+  set(CMAKE_CUDA_HOST_COMPILER "${CMAKE_CXX_COMPILER}")
   enable_language(CUDA)
   # Determine CUDA_ARCHITECTURES automatically.
   cmake_policy(SET CMP0104 NEW)
