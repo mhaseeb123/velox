@@ -58,7 +58,7 @@ services:
 
   adapters-cpp:
     extends: centos-cpp
-    image: ghcr.io/facebookincubator/velox-dev:mhaseeb-test-adapters
+    image: ghcr.io/facebookincubator/velox-dev:adapters
     environment:
       EXTRA_CMAKE_FLAGS: >-
         -DVELOX_ENABLE_PARQUET=ON
