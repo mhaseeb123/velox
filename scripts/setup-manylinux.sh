@@ -57,7 +57,7 @@ function install_build_prerequisites {
   dnf_install epel-release dnf-plugins-core # For ccache, ninja
   dnf config-manager --set-enabled crb
   dnf update -y
-  dnf_install ninja-build cmake ccache gcc-toolset-12 git wget which
+  dnf_install ninja-build cmake ccache gcc-toolset-14 git wget which
   dnf_install autoconf automake python3-devel pip libtool
 
   if [[ ${USE_CLANG} != "false" ]]; then
@@ -134,8 +134,8 @@ function install_velox_deps {
       export CC=/usr/bin/clang-15
       export CXX=/usr/bin/clang++-15
     else
-      # Activate gcc12; enable errors on unset variables afterwards.
-      source /opt/rh/gcc-toolset-12/enable || exit 1
+      # Activate gcc14; enable errors on unset variables afterwards.
+      source /opt/rh/gcc-toolset-14/enable || exit 1
       set -u
     fi
 
@@ -154,8 +154,8 @@ function install_velox_deps {
       export CC=/usr/bin/clang-15
       export CXX=/usr/bin/clang++-15
     else
-      # Activate gcc12; enable errors on unset variables afterwards.
-      source /opt/rh/gcc-toolset-12/enable || exit 1
+      # Activate gcc14; enable errors on unset variables afterwards.
+      source /opt/rh/gcc-toolset-14/enable || exit 1
       set -u
     fi
     install_velox_deps

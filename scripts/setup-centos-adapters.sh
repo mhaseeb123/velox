@@ -125,8 +125,8 @@ function install_adapters {
 
 (
   if [[ $# -ne 0 ]]; then
-    # Activate gcc12; enable errors on unset variables afterwards.
-    source /opt/rh/gcc-toolset-12/enable || exit 1
+    # Activate gcc14; enable errors on unset variables afterwards.
+    source /opt/rh/gcc-toolset-14/enable || exit 1
     set -u
 
     for cmd in "$@"; do
@@ -134,8 +134,8 @@ function install_adapters {
     done
     echo "All specified dependencies installed!"
   else
-    # Activate gcc12; enable errors on unset variables afterwards.
-    source /opt/rh/gcc-toolset-12/enable || exit 1
+    # Activate gcc14; enable errors on unset variables afterwards.
+    source /opt/rh/gcc-toolset-14/enable || exit 1
     set -u
     install_cuda "$VELOX_CUDA_VERSION"
     install_adapters

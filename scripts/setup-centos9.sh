@@ -56,7 +56,7 @@ function install_build_prerequisites {
     dnf config-manager --set-enabled crb
     dnf update -y
   fi
-  dnf_install autoconf automake ccache clang gcc-toolset-12 gcc-toolset-14 git libtool \
+  dnf_install autoconf automake ccache clang gcc-toolset-14 git libtool \
     llvm ninja-build python3-pip python3-devel wget which
 
   install_uv
@@ -125,8 +125,8 @@ function install_velox_deps {
       export CC=/usr/bin/clang-15
       export CXX=/usr/bin/clang++-15
     else
-      # Activate gcc12; enable errors on unset variables afterwards.
-      source /opt/rh/gcc-toolset-12/enable || exit 1
+      # Activate gcc14; enable errors on unset variables afterwards.
+      source /opt/rh/gcc-toolset-14/enable || exit 1
       set -u
     fi
 
@@ -145,8 +145,8 @@ function install_velox_deps {
       export CC=/usr/bin/clang-15
       export CXX=/usr/bin/clang++-15
     else
-      # Activate gcc12; enable errors on unset variables afterwards.
-      source /opt/rh/gcc-toolset-12/enable || exit 1
+      # Activate gcc14; enable errors on unset variables afterwards.
+      source /opt/rh/gcc-toolset-14/enable || exit 1
       set -u
     fi
     install_velox_deps

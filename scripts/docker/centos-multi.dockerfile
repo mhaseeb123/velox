@@ -86,10 +86,10 @@ RUN /bin/bash -c "source /setup-centos9.sh && \
       dnf_install gh jq && \
       dnf clean all"
 
-ENV CC=/opt/rh/gcc-toolset-12/root/bin/gcc \
-    CXX=/opt/rh/gcc-toolset-12/root/bin/g++
+ENV CC=/opt/rh/gcc-toolset-14/root/bin/gcc \
+    CXX=/opt/rh/gcc-toolset-14/root/bin/g++
 
-ENTRYPOINT ["/bin/bash", "-c", "source /opt/rh/gcc-toolset-12/enable && exec \"$@\"", "--"]
+ENTRYPOINT ["/bin/bash", "-c", "source /opt/rh/gcc-toolset-14/enable && exec \"$@\"", "--"]
 CMD ["/bin/bash"]
 
 ########################
@@ -162,5 +162,5 @@ ENV HADOOP_HOME=/usr/local/hadoop \
 COPY --from=adapters-build /deps /usr/local
 
 COPY scripts/setup-classpath.sh /
-ENTRYPOINT ["/bin/bash", "-c", "source /setup-classpath.sh && source /opt/rh/gcc-toolset-12/enable && exec \"$@\"", "--"]
+ENTRYPOINT ["/bin/bash", "-c", "source /setup-classpath.sh && source /opt/rh/gcc-toolset-14/enable && exec \"$@\"", "--"]
 CMD ["/bin/bash"]

@@ -117,7 +117,7 @@ jobs:
 
             mkdir /tmp/build
             cd /tmp/build
-            source /opt/rh/gcc-toolset-12/enable
+            source /opt/rh/gcc-toolset-14/enable
             # Install basic deps with GCC. Some deps have problems (e.g. folly missing atomic lib).
             USE_CLANG=false bash /setup-centos9.sh
 
