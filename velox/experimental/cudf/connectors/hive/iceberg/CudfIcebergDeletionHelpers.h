@@ -33,19 +33,16 @@ namespace facebook::velox::cudf_velox::connector::hive::iceberg {
 /// row mask, applies it to the input table, returning the new output table.
 std::unique_ptr<cudf::table> applyDeleteBitmap(
     cudf::table_view input,
-    const uint8_t* hostBitmap,
-    std::shared_ptr<rmm::device_buffer> deviceBitmap,
-    std::shared_ptr<rmm::device_buffer> rowMask,
+    cudf::device_span<cudf::bitmask_type const> deviceBitmap,
+    cudf::device_span<bool> rowMask,
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref temp_mr,
     rmm::device_async_resource_ref output_mr);
 
-/// Clears the surviving row mask at positions identified by matchedIndices
-/// (anti-join semantics: matched rows are deleted).
-void applyDeletePositions(
-    std::shared_ptr<rmm::device_buffer> rowMask,
-    cudf::size_type numRows,
-    cudf::device_span<cudf::size_type const> matchedIndices,
+/// Scatters deletes to the row mask to all positions in `indices` (anti-join)
+void scatterDeletesToRowMask(
+    cudf::device_span<bool> rowMask,
+    cudf::device_span<cudf::size_type const> indices,
     rmm::cuda_stream_view stream);
 
 } // namespace facebook::velox::cudf_velox::connector::hive::iceberg

@@ -45,38 +45,27 @@ struct IsSurvivingRow {
 
 std::unique_ptr<cudf::table> applyDeleteBitmap(
     cudf::table_view input,
-    const uint8_t* hostBitmap,
-    std::shared_ptr<rmm::device_buffer> deviceBitmap,
-    std::shared_ptr<rmm::device_buffer> rowMask,
+    cudf::device_span<cudf::bitmask_type const> deviceBitmap,
+    cudf::device_span<bool> rowMask,
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref temp_mr,
     rmm::device_async_resource_ref output_mr) {
   const auto numRows = input.num_rows();
-  const auto numWords = cudf::num_bitmask_words(numRows);
-  const auto numBitmaskBytes = numWords * sizeof(cudf::bitmask_type);
 
-  // Copy the deletion bitmap to device
-  CUDF_CUDA_TRY(cudaMemcpyAsync(
-      deviceBitmap->data(),
-      hostBitmap,
-      numBitmaskBytes,
-      cudaMemcpyHostToDevice,
-      stream.value()));
-
-  // Transform the deletion bitmap to the surviving row mask
+  // Transform the deletion bitmap to the surviving row mask inplace
+  // Alternate: Use `cudf::mask_to_bools` but it produces a new column.
   thrust::transform(
       rmm::exec_policy_nosync(stream, temp_mr),
       cuda::counting_iterator<cudf::size_type>{0},
       cuda::counting_iterator<cudf::size_type>{numRows},
-      static_cast<bool*>(rowMask->data()),
-      IsSurvivingRow{
-          static_cast<const cudf::bitmask_type*>(deviceBitmap->data())});
+      rowMask.begin(),
+      IsSurvivingRow{deviceBitmap.data()});
 
   // Convert the surviving row mask to a column view
   auto rowMaskCol = cudf::column_view(
       cudf::data_type{cudf::type_id::BOOL8},
       numRows,
-      rowMask->data(),
+      rowMask.data(),
       nullptr,
       0,
       0);
@@ -85,17 +74,17 @@ std::unique_ptr<cudf::table> applyDeleteBitmap(
   return cudf::apply_boolean_mask(input, rowMaskCol, stream, output_mr);
 }
 
-void applyDeletePositions(
-    std::shared_ptr<rmm::device_buffer> rowMask,
-    cudf::size_type numRows,
+void scatterDeletesToRowMask(
+    cudf::device_span<bool> rowMask,
     cudf::device_span<cudf::size_type const> indices,
     rmm::cuda_stream_view stream) {
+  auto iter = cuda::constant_iterator<bool>(false);
   thrust::scatter(
       rmm::exec_policy_nosync(stream),
-      cuda::constant_iterator<bool>(false),
-      cuda::constant_iterator<bool>(false) + indices.size(),
+      iter,
+      iter + indices.size(),
       indices.begin(),
-      static_cast<bool*>(rowMask->data()));
+      rowMask.begin());
 }
 
 } // namespace facebook::velox::cudf_velox::connector::hive::iceberg

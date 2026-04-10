@@ -30,6 +30,7 @@
 #include <cudf/stream_compaction.hpp>
 #include <cudf/unary.hpp>
 #include <cudf/utilities/error.hpp>
+#include <cudf/utilities/span.hpp>
 
 #include <rmm/device_buffer.hpp>
 
@@ -374,11 +375,22 @@ std::unique_ptr<cudf::table> CudfIcebergSplitReader::applyPositionalDeletes(
   VELOX_CHECK_NOT_NULL(rowMask_->data());
   VELOX_CHECK_GE(rowMask_->size(), numRows);
 
+  // Copy the deletion bitmap to device
+  const auto numWords = cudf::num_bitmask_words(numRows);
+  const auto numBitmaskBytes = numWords * sizeof(cudf::bitmask_type);
+  CUDF_CUDA_TRY(cudaMemcpyAsync(
+      deviceDeleteBitmap_->data(),
+      deleteBitmap_->as<uint8_t>(),
+      numBitmaskBytes,
+      cudaMemcpyHostToDevice,
+      stream_.value()));
+
   return applyDeleteBitmap(
       input,
-      deleteBitmap_->as<uint8_t>(),
-      deviceDeleteBitmap_,
-      rowMask_,
+      cudf::device_span<cudf::bitmask_type>(
+          static_cast<cudf::bitmask_type*>(deviceDeleteBitmap_->data()),
+          numWords),
+      cudf::device_span<bool>(static_cast<bool*>(rowMask_->data()), numRows),
       stream_,
       get_temp_mr(),
       output_mr);

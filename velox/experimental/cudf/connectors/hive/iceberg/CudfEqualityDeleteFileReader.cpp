@@ -236,7 +236,8 @@ void CudfEqualityDeleteFileReader::applyDeletes(
     std::shared_ptr<rmm::device_buffer> rowMask,
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref mr) {
-  if (empty() or table.num_rows() == 0) {
+  const auto numRows = table.num_rows();
+  if (empty() or numRows == 0) {
     return;
   }
 
@@ -253,7 +254,10 @@ void CudfEqualityDeleteFileReader::applyDeletes(
 
   // Clear `rowMask` at probe positions if any
   if (not probeIndices->is_empty()) {
-    applyDeletePositions(rowMask, table.num_rows(), *probeIndices, stream);
+    scatterDeletesToRowMask(
+        cudf::device_span<bool>(static_cast<bool*>(rowMask->data()), numRows),
+        *probeIndices,
+        stream);
   }
 }
 
