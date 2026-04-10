@@ -91,6 +91,10 @@ class CudfIcebergSplitReader : public CudfSplitReader {
       cudf::table_view input,
       rmm::device_async_resource_ref output_mr);
 
+  /// Setup column projection to include any equality delete key columns
+  /// that are not already in the output projection.
+  void setupColumnProjection();
+
   std::shared_ptr<const velox_iceberg::HiveIcebergSplit> icebergSplit_;
   std::shared_ptr<const velox_hive::HiveConfig> hiveConfig_;
 
@@ -104,6 +108,10 @@ class CudfIcebergSplitReader : public CudfSplitReader {
   /// Equality delete file readers.
   std::list<std::unique_ptr<CudfEqualityDeleteFileReader>>
       equalityDeleteFileReaders_;
+
+  /// Extra equality delete key columns appended to readColumnNames_ that
+  /// are not part of the output projection.
+  std::vector<std::string> extraEqualityColumns_;
 
   /// Tracks the absolute row offset within the data file. Each chunk advances
   /// this by the number of rows read (before deletes).

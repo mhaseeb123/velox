@@ -36,6 +36,7 @@
 #include <folly/lang/Bits.h>
 
 #include <cstring>
+#include <unordered_set>
 
 namespace facebook::velox::cudf_velox::connector::hive::iceberg {
 
@@ -107,12 +108,18 @@ void CudfIcebergSplitReader::prepareSplit() {
   deletionVectorReader_.reset();
   positionalDeleteFileReaders_.clear();
   equalityDeleteFileReaders_.clear();
+  extraEqualityColumns_.clear();
   baseReadOffset_ = 0;
 
   // Note: Must setup delete file readers before calling base `prepareSplit` so
   // that it can correctly determine the memory resource to construct the cuDF
   // reader.
   setupDeleteFileReaders();
+
+  // Setup column projection to include any equality delete key columns that
+  // are not already in the output projection. Must be called before base
+  // `prepareSplit`
+  setupColumnProjection();
 
   // Call base to setup stream, datasource, options, and the cudf reader
   CudfSplitReader::prepareSplit();
@@ -205,6 +212,18 @@ CudfIcebergSplitReader::readNextChunk(
   if (cudfTable->num_rows() > 0 and not equalityDeleteFileReaders_.empty()) {
     // Use the output mr as there will be no more deletes after this
     cudfTable = applyEqualityDeletes(cudfTable->view(), output_mr);
+  }
+
+  // Strip any extra equality delete key columns that were added
+  if (not extraEqualityColumns_.empty()) {
+    VELOX_CHECK_EQ(
+        extraEqualityColumns_.size(),
+        cudfTable->num_columns() - outputType_->size(),
+        "Unexpected number of extra equality delete key columns: {}",
+        extraEqualityColumns_.size());
+    auto columns = cudfTable->release();
+    columns.resize(outputType_->size());
+    cudfTable = std::make_unique<cudf::table>(std::move(columns));
   }
 
   // Update the base read offset
@@ -368,7 +387,7 @@ std::unique_ptr<cudf::table> CudfIcebergSplitReader::applyPositionalDeletes(
 std::unique_ptr<cudf::table> CudfIcebergSplitReader::applyEqualityDeletes(
     cudf::table_view input,
     rmm::device_async_resource_ref output_mr) {
-  auto const numRows = input.num_rows();
+  const auto numRows = input.num_rows();
 
   // Reset the row mask to all-true
   VELOX_CHECK_NOT_NULL(rowMask_->data());
@@ -379,7 +398,7 @@ std::unique_ptr<cudf::table> CudfIcebergSplitReader::applyEqualityDeletes(
   // Apply equality deletes, if any
   for (auto& reader : equalityDeleteFileReaders_) {
     reader->applyDeletes(
-        input, outputType_->names(), rowMask_, stream_, get_temp_mr());
+        input, readColumnNames_, rowMask_, stream_, get_temp_mr());
   }
 
   // Convert the row mask to a column view and apply the boolean mask to the
@@ -393,6 +412,49 @@ std::unique_ptr<cudf::table> CudfIcebergSplitReader::applyEqualityDeletes(
       0);
 
   return cudf::apply_boolean_mask(input, rowMaskCol, stream_, output_mr);
+}
+
+void CudfIcebergSplitReader::setupColumnProjection() {
+  if (equalityDeleteFileReaders_.empty()) {
+    return;
+  }
+
+  std::unordered_set<std::string> readColumnSet(
+      readColumnNames_.begin(), readColumnNames_.end());
+  const auto& dataColumns = tableHandle_->dataColumns();
+
+  // For each equality delete file, find and append any columns that are not
+  // already in the readColumnSet
+  std::for_each(
+      icebergSplit_->deleteFiles.begin(),
+      icebergSplit_->deleteFiles.end(),
+      [&](const auto& deleteFile) {
+        if (deleteFile.content !=
+                velox_iceberg::FileContent::kEqualityDeletes or
+            deleteFile.equalityFieldIds.empty()) {
+          return;
+        }
+        std::for_each(
+            deleteFile.equalityFieldIds.begin(),
+            deleteFile.equalityFieldIds.end(),
+            [&](const auto& equalityFieldId) {
+              const auto columnIdx = static_cast<uint32_t>(equalityFieldId - 1);
+              if (dataColumns and columnIdx < dataColumns->size()) {
+                const auto& columnName = dataColumns->nameOf(columnIdx);
+                // Insert column name into readColumnSet if not already present
+                if (readColumnSet.insert(columnName).second) {
+                  extraEqualityColumns_.push_back(columnName);
+                }
+              }
+            });
+      });
+
+  // Append extra columns to readColumnNames_ so the Parquet reader fetches
+  // them.
+  readColumnNames_.insert(
+      readColumnNames_.end(),
+      extraEqualityColumns_.begin(),
+      extraEqualityColumns_.end());
 }
 
 } // namespace facebook::velox::cudf_velox::connector::hive::iceberg

@@ -896,4 +896,191 @@ TEST_F(CudfIcebergReadTest, positionalDeleteSequenceNumberZeroDisablesFilter) {
   AssertQueryBuilder(plan).splits(splits).assertResults({expected});
 }
 
+/// Edge-case tests from Sirius project
+
+/// Combined positional + equality deletes on the same data file.
+/// Verifies that positional deletes (position-based) and equality deletes
+/// (value-based) compose correctly when applied sequentially.
+TEST_F(CudfIcebergReadTest, combinedPositionalAndEqualityDeletes) {
+  folly::SingletonVault::singleton()->registrationComplete();
+
+  auto rowType = ROW({"c0", "c1"}, {BIGINT(), BIGINT()});
+
+  auto baseData = makeRowVector({
+      makeFlatVector<int64_t>({0, 1, 2, 3, 4, 5, 6, 7, 8, 9}),
+      makeFlatVector<int64_t>({10, 11, 12, 13, 14, 15, 16, 17, 18, 19}),
+  });
+  auto dataFile = TempFilePath::create();
+  writeToFile(dataFile->getPath(), baseData);
+
+  // Positional delete: remove rows at positions 1 and 3 (c0=1, c0=3)
+  auto pathColumn = IcebergMetadataColumn::icebergDeleteFilePathColumn();
+  auto posColumn = IcebergMetadataColumn::icebergDeletePosColumn();
+  auto posDeleteFile = TempFilePath::create();
+  auto filePathVec = makeFlatVector<std::string>(
+      2, [&](vector_size_t) { return dataFile->getPath(); });
+  auto posVec = makeFlatVector<int64_t>({1, 3});
+  auto posDeleteVector =
+      makeRowVector({pathColumn->name, posColumn->name}, {filePathVec, posVec});
+  writeDeleteFile(
+      DeleteFileFormat::DWRF,
+      posDeleteFile->getPath(),
+      std::vector<RowVectorPtr>{posDeleteVector});
+
+  IcebergDeleteFile posIcebergDelete(
+      FileContent::kPositionalDeletes,
+      posDeleteFile->getPath(),
+      dwio::common::FileFormat::DWRF,
+      2,
+      getFileSize(posDeleteFile->getPath()));
+
+  // Equality delete: remove rows where c0={5, 7}
+  auto eqDeleteData = makeRowVector({
+      makeFlatVector<int64_t>({5, 7}),
+  });
+  auto eqDeleteFile = TempFilePath::create();
+  writeDeleteFile(
+      DeleteFileFormat::PARQUET, eqDeleteFile->getPath(), {eqDeleteData});
+
+  IcebergDeleteFile eqIcebergDelete(
+      FileContent::kEqualityDeletes,
+      eqDeleteFile->getPath(),
+      dwio::common::FileFormat::PARQUET,
+      2,
+      getFileSize(eqDeleteFile->getPath()),
+      /*equalityFieldIds=*/{1});
+
+  auto splits = makeIcebergSplits(
+      dataFile->getPath(), {posIcebergDelete, eqIcebergDelete});
+  auto plan = makeTableScanPlan(rowType);
+  auto result = AssertQueryBuilder(plan).splits(splits).copyResults(pool());
+
+  // Positional removes pos 1,3 (c0=1,3). Equality removes c0=5,7.
+  // Surviving: 0, 2, 4, 6, 8, 9
+  auto expected = makeRowVector({
+      makeFlatVector<int64_t>({0, 2, 4, 6, 8, 9}),
+      makeFlatVector<int64_t>({10, 12, 14, 16, 18, 19}),
+  });
+
+  assertEqualResults({expected}, {result});
+}
+
+/// Non-projected equality delete key column.
+/// Query selects only c1, but equality delete key is c0.
+/// The reader must force-project c0 for filtering then strip it from output.
+TEST_F(CudfIcebergReadTest, nonProjectedDeleteKeyColumn) {
+  folly::SingletonVault::singleton()->registrationComplete();
+
+  auto fullType = ROW({"c0", "c1"}, {BIGINT(), BIGINT()});
+  auto outputType = ROW({"c1"}, {BIGINT()});
+
+  auto baseData = makeRowVector({
+      makeFlatVector<int64_t>({1, 2, 3, 4, 5}),
+      makeFlatVector<int64_t>({10, 20, 30, 40, 50}),
+  });
+  auto dataFile = TempFilePath::create();
+  writeToFile(dataFile->getPath(), baseData);
+
+  // Equality delete on c0 (NOT in the output projection)
+  auto eqDeleteData = makeRowVector({
+      makeFlatVector<int64_t>({2, 4}),
+  });
+  auto eqDeleteFile = TempFilePath::create();
+  writeDeleteFile(
+      DeleteFileFormat::PARQUET, eqDeleteFile->getPath(), {eqDeleteData});
+
+  IcebergDeleteFile eqIcebergDelete(
+      FileContent::kEqualityDeletes,
+      eqDeleteFile->getPath(),
+      dwio::common::FileFormat::PARQUET,
+      2,
+      getFileSize(eqDeleteFile->getPath()),
+      /*equalityFieldIds=*/{1});
+
+  auto splits = makeIcebergSplits(dataFile->getPath(), {eqIcebergDelete});
+
+  auto plan = PlanBuilder()
+                  .startTableScan()
+                  .connectorId(kCudfIcebergConnectorId)
+                  .outputType(outputType)
+                  .dataColumns(fullType)
+                  .endTableScan()
+                  .planNode();
+
+  auto result = AssertQueryBuilder(plan).splits(splits).copyResults(pool());
+
+  // c0=2,4 deleted -> c1=20,40 removed
+  auto expected = makeRowVector({
+      makeFlatVector<int64_t>({10, 30, 50}),
+  });
+
+  assertEqualResults({expected}, {result});
+}
+
+/// Insert-delete-insert interleaving: data written after a delete (higher
+/// sequence number) should NOT be affected by that delete.
+TEST_F(CudfIcebergReadTest, insertDeleteInsertInterleaving) {
+  folly::SingletonVault::singleton()->registrationComplete();
+
+  auto rowType = ROW({"c0", "c1"}, {BIGINT(), BIGINT()});
+
+  // File 1: original data (seq=1)
+  auto data1 = makeRowVector({
+      makeFlatVector<int64_t>({1, 2, 3}),
+      makeFlatVector<int64_t>({10, 20, 30}),
+  });
+  auto dataFile1 = TempFilePath::create();
+  writeToFile(dataFile1->getPath(), data1);
+
+  // File 2: data written AFTER the delete (seq=3)
+  auto data2 = makeRowVector({
+      makeFlatVector<int64_t>({2, 4}),
+      makeFlatVector<int64_t>({200, 400}),
+  });
+  auto dataFile2 = TempFilePath::create();
+  writeToFile(dataFile2->getPath(), data2);
+
+  // Equality delete at seq=2: delete c0=2
+  auto eqDeleteData = makeRowVector({
+      makeFlatVector<int64_t>({2}),
+  });
+  auto eqDeleteFile = TempFilePath::create();
+  writeDeleteFile(
+      DeleteFileFormat::PARQUET, eqDeleteFile->getPath(), {eqDeleteData});
+
+  IcebergDeleteFile eqIcebergDelete(
+      FileContent::kEqualityDeletes,
+      eqDeleteFile->getPath(),
+      dwio::common::FileFormat::PARQUET,
+      1,
+      getFileSize(eqDeleteFile->getPath()),
+      /*equalityFieldIds=*/{1},
+      /*lowerBounds=*/{},
+      /*upperBounds=*/{},
+      /*dataSequenceNumber=*/2);
+
+  // File 1: data seq=1, delete seq=2 -> delete APPLIES (2 > 1)
+  auto splits1 = makeIcebergSplits(
+      dataFile1->getPath(), {eqIcebergDelete}, {}, 1, /*dataSeq=*/1);
+  // File 2: data seq=3, delete seq=2 -> delete SKIPPED (2 < 3)
+  auto splits2 = makeIcebergSplits(
+      dataFile2->getPath(), {eqIcebergDelete}, {}, 1, /*dataSeq=*/3);
+
+  std::vector<std::shared_ptr<facebook::velox::connector::ConnectorSplit>>
+      allSplits;
+  allSplits.insert(allSplits.end(), splits1.begin(), splits1.end());
+  allSplits.insert(allSplits.end(), splits2.begin(), splits2.end());
+
+  auto plan = makeTableScanPlan(rowType);
+  auto result = AssertQueryBuilder(plan).splits(allSplits).copyResults(pool());
+
+  // File1 loses c0=2 (delete applies), file2 keeps c0=2 (delete skipped)
+  auto expected = makeRowVector({
+      makeFlatVector<int64_t>({1, 3, 2, 4}),
+      makeFlatVector<int64_t>({10, 30, 200, 400}),
+  });
+
+  assertEqualResults({expected}, {result});
+}
+
 } // namespace facebook::velox::cudf_velox::exec::test
