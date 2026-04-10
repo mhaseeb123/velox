@@ -95,6 +95,19 @@ class CudfIcebergSplitReader : public CudfSplitReader {
   /// that are not already in the output projection.
   void setupColumnProjection();
 
+  /// Detect partition columns and columns missing due to schema evolution.
+  /// Filters partition columns from readColumnNames_ and records which
+  /// output columns need post-read injection (constant partition values
+  /// or typed NULLs for schema evolution).
+  void setupSchemaReconciliation();
+
+  /// Inject partition columns and schema-evolution NULL columns into the
+  /// cudf table after reading. Returns a new table with all output columns
+  /// in the correct order.
+  std::unique_ptr<cudf::table> injectMissingColumns(
+      std::unique_ptr<cudf::table> table,
+      rmm::device_async_resource_ref mr);
+
   std::shared_ptr<const velox_iceberg::HiveIcebergSplit> icebergSplit_;
   std::shared_ptr<const velox_hive::HiveConfig> hiveConfig_;
 
@@ -112,6 +125,18 @@ class CudfIcebergSplitReader : public CudfSplitReader {
   /// Extra equality delete key columns appended to readColumnNames_ that
   /// are not part of the output projection.
   std::vector<std::string> extraEqualityColumns_;
+
+  /// Describes a column that must be injected after reading because it is
+  /// not present in the parquet file (partition column or schema evolution).
+  struct InjectedColumn {
+    size_t outputIndex;  // position in the final output schema
+    std::string name;
+    std::optional<std::string> partitionValue;  // nullopt = NULL (schema evolution)
+    TypePtr veloxType;
+  };
+
+  /// Columns to inject after reading. Populated by setupSchemaReconciliation().
+  std::vector<InjectedColumn> injectedColumns_;
 
   /// Tracks the absolute row offset within the data file. Each chunk advances
   /// this by the number of rows read (before deletes).
