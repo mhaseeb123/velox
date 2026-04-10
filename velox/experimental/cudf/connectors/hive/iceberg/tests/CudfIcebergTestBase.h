@@ -26,10 +26,13 @@ namespace facebook::velox::cudf_velox::exec::test {
 
 static const std::string kCudfIcebergConnectorId = "test-cudf-iceberg";
 
+/// Format selector for writing delete files in tests.
+enum class DeleteFileFormat : bool { DWRF, PARQUET };
+
 /// Test base for CudfIcebergConnector tests. Registers the
 /// CudfIcebergConnectorFactory and provides helpers for creating Iceberg
 /// splits, writing parquet data files (via CudfHiveConnectorTestBase), and
-/// writing DWRF delete files (via the upstream velox::dwrf::Writer).
+/// writing delete files in DWRF or Parquet format (via upstream Velox writers).
 class CudfIcebergTestBase : public CudfHiveConnectorTestBase {
  public:
   void SetUp() override;
@@ -48,12 +51,19 @@ class CudfIcebergTestBase : public CudfHiveConnectorTestBase {
       uint32_t splitCount = 1,
       int64_t dataSequenceNumber = 0);
 
-  /// Writes a DWRF file using the upstream velox::dwrf::Writer. Used for
-  /// equality and positional delete files which are read by the upstream
-  /// Velox DWRF reader (not cudf).
+  /// Writes a delete file in the specified format using the upstream Velox
+  /// DWRF or Parquet writer.
   void writeDeleteFile(
+      DeleteFileFormat format,
       const std::string& filePath,
       const std::vector<RowVectorPtr>& vectors);
+
+  /// Returns the dwio::common::FileFormat corresponding to the test enum.
+  static dwio::common::FileFormat toDwioFormat(DeleteFileFormat format) {
+    return format == DeleteFileFormat::PARQUET
+        ? dwio::common::FileFormat::PARQUET
+        : dwio::common::FileFormat::DWRF;
+  }
 
   uint64_t getFileSize(const std::string& path);
 

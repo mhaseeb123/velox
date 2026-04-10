@@ -20,6 +20,8 @@
 #include "velox/dwio/dwrf/RegisterDwrfReader.h"
 #include "velox/dwio/dwrf/RegisterDwrfWriter.h"
 #include "velox/dwio/dwrf/writer/Writer.h"
+#include "velox/dwio/parquet/RegisterParquetWriter.h"
+#include "velox/dwio/parquet/writer/Writer.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
 
 namespace facebook::velox::cudf_velox::exec::test {
@@ -35,6 +37,7 @@ void CudfIcebergTestBase::SetUp() {
   // delete files.
   dwrf::registerDwrfReaderFactory();
   dwrf::registerDwrfWriterFactory();
+  parquet::registerParquetWriterFactory();
 
   connector::hive::iceberg::CudfIcebergConnectorFactory factory;
   auto icebergConnector = factory.newConnector(
@@ -49,6 +52,7 @@ void CudfIcebergTestBase::TearDown() {
   facebook::velox::connector::unregisterConnector(kCudfIcebergConnectorId);
   dwrf::unregisterDwrfReaderFactory();
   dwrf::unregisterDwrfWriterFactory();
+  parquet::unregisterParquetWriterFactory();
   CudfHiveConnectorTestBase::TearDown();
 }
 
@@ -93,13 +97,10 @@ CudfIcebergTestBase::makeIcebergSplits(
 }
 
 void CudfIcebergTestBase::writeDeleteFile(
+    DeleteFileFormat format,
     const std::string& filePath,
     const std::vector<RowVectorPtr>& vectors) {
-  // Uses the upstream velox::dwrf::Writer — same as
-  // HiveConnectorTestBase::writeToFile.
-  velox::dwrf::WriterOptions options;
-  options.config = std::make_shared<facebook::velox::dwrf::Config>();
-  options.schema = vectors[0]->type();
+  auto schema = vectors[0]->type();
   auto fs = filesystems::getFileSystem(filePath, {});
   auto writeFile = fs->openFileForWrite(
       filePath,
@@ -107,15 +108,28 @@ void CudfIcebergTestBase::writeDeleteFile(
        .shouldThrowOnFileAlreadyExists = false});
   auto sink = std::make_unique<dwio::common::WriteFileSink>(
       std::move(writeFile), filePath);
-  auto childPool =
-      rootPool_->addAggregateChild("CudfIcebergTestBase.DwrfWriter");
-  options.memoryPool = childPool.get();
 
-  facebook::velox::dwrf::Writer writer{std::move(sink), options};
-  for (const auto& vector : vectors) {
-    writer.write(vector);
+  std::unique_ptr<dwio::common::Writer> writer;
+  if (format == DeleteFileFormat::PARQUET) {
+    auto childPool =
+        rootPool_->addAggregateChild("CudfIcebergTestBase.ParquetWriter");
+    velox::parquet::WriterOptions options;
+    writer = std::make_unique<velox::parquet::Writer>(
+        std::move(sink), options, childPool, std::dynamic_pointer_cast<const RowType>(schema));
+  } else {
+    auto childPool =
+        rootPool_->addAggregateChild("CudfIcebergTestBase.DwrfWriter");
+    velox::dwrf::WriterOptions options;
+    options.config = std::make_shared<facebook::velox::dwrf::Config>();
+    options.schema = schema;
+    options.memoryPool = childPool.get();
+    writer = std::make_unique<velox::dwrf::Writer>(std::move(sink), options);
   }
-  writer.close();
+
+  for (const auto& vector : vectors) {
+    writer->write(vector);
+  }
+  writer->close();
 }
 
 uint64_t CudfIcebergTestBase::getFileSize(const std::string& path) {

@@ -14,8 +14,10 @@
  * limitations under the License.
  */
 
+#include "velox/experimental/cudf/connectors/hive/CudfSplitReaderHelpers.h"
 #include "velox/experimental/cudf/connectors/hive/iceberg/CudfEqualityDeleteFileReader.h"
 #include "velox/experimental/cudf/connectors/hive/iceberg/CudfIcebergDeletionHelpers.h"
+#include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 
 #include "velox/common/base/Exceptions.h"
@@ -27,6 +29,7 @@
 #include "velox/dwio/common/ReaderFactory.h"
 
 #include <cudf/detail/search.hpp>
+#include <cudf/io/parquet.hpp>
 #include <cudf/types.hpp>
 
 #include <limits>
@@ -100,6 +103,13 @@ CudfEqualityDeleteFileReader::CudfEqualityDeleteFileReader(
           ioStats,
           executor);
 
+  // Directly read the Parquet-format equality delete file to the
+  // deleteKeyTable_ using cuDF
+  if (deleteFile.fileFormat == dwio::common::FileFormat::PARQUET) {
+    directReadEqualityDeleteFile(deleteFile, std::move(deleteFileInput));
+    return;
+  }
+
   auto deleteReader =
       dwio::common::getReaderFactory(deleteReaderOpts.fileFormat())
           ->createReader(std::move(deleteFileInput), deleteReaderOpts);
@@ -143,10 +153,39 @@ CudfEqualityDeleteFileReader::CudfEqualityDeleteFileReader(
   numDeleteKeys_ = deleteRows_->size();
 }
 
+void CudfEqualityDeleteFileReader::directReadEqualityDeleteFile(
+    const velox_iceberg::IcebergDeleteFile& deleteFile,
+    std::shared_ptr<dwio::common::BufferedInput> bufferedInput) {
+  using cudf_velox::connector::hive::BufferedInputDataSource;
+
+  // Create a cuDF data source
+  std::shared_ptr<cudf::io::datasource> dataSource;
+  auto sourceInfo = [&]() {
+    if (bufferedInput) {
+      dataSource =
+          std::make_shared<BufferedInputDataSource>(std::move(bufferedInput));
+      return cudf::io::source_info{dataSource.get()};
+    }
+    return cudf::io::source_info{deleteFile.filePath};
+  }();
+
+  // Read the equality delete file
+  auto options =
+      cudf::io::parquet_reader_options::builder(std::move(sourceInfo)).build();
+  options.set_column_names(equalityColumnNames_);
+  auto stream = cudfGlobalStreamPool().get_stream();
+  deleteKeyTable_ =
+      cudf::io::read_parquet(options, stream, get_output_mr()).tbl;
+  stream.synchronize();
+
+  VELOX_CHECK_NOT_NULL(deleteKeyTable_);
+  numDeleteKeys_ = deleteKeyTable_->num_rows();
+}
+
 void CudfEqualityDeleteFileReader::buildDeleteKeyTable(
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref mr) {
-  if (isLoaded_ or deleteKeyTable_) {
+  if (deleteKeyTable_) {
     return;
   }
 
@@ -160,7 +199,7 @@ void CudfEqualityDeleteFileReader::buildDeleteKeyTable(
 
 void CudfEqualityDeleteFileReader::buildEqualityColumnIndices(
     const std::vector<std::string>& inputColumnNames) {
-  if (isLoaded_ or not equalityColumnIndices_.empty()) {
+  if (not equalityColumnIndices_.empty()) {
     return;
   }
 
@@ -195,7 +234,6 @@ void CudfEqualityDeleteFileReader::applyDeletes(
 
   buildDeleteKeyTable(stream, mr);
   buildEqualityColumnIndices(inputColumnNames);
-  isLoaded_ = true;
 
   // `cudf::detail::contains` returns a device vector of bools containing `true`
   // if the probe row exists in the delete key table. We use

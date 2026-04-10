@@ -270,7 +270,10 @@ class CudfIcebergReadTest : public CudfIcebergTestBase {
         totalPositionsInDeleteFile += positionsInRowGroup.size();
       }
 
-      writeDeleteFile(deleteFilePath->getPath(), deleteFileVectors);
+      writeDeleteFile(
+          DeleteFileFormat::DWRF,
+          deleteFilePath->getPath(),
+          deleteFileVectors);
 
       deleteFilePaths[deleteFileName] =
           std::make_pair(totalPositionsInDeleteFile, deleteFilePath);
@@ -692,6 +695,7 @@ TEST_F(CudfIcebergReadTest, positionalDeleteSequenceNumberApplied) {
   auto deleteFilePath = TempFilePath::create();
   auto baseFilePath = dataFilePath->getPath();
   writeDeleteFile(
+      DeleteFileFormat::DWRF,
       deleteFilePath->getPath(),
       {makeRowVector(
           {pathColumn->name, posColumn->name},
@@ -745,6 +749,7 @@ TEST_F(CudfIcebergReadTest, positionalDeleteSequenceNumberSkipped) {
   auto deleteFilePath = TempFilePath::create();
   auto baseFilePath = dataFilePath->getPath();
   writeDeleteFile(
+      DeleteFileFormat::DWRF,
       deleteFilePath->getPath(),
       {makeRowVector(
           {pathColumn->name, posColumn->name},
@@ -798,6 +803,7 @@ TEST_F(CudfIcebergReadTest, positionalDeleteSequenceNumberEqualApplied) {
   auto deleteFilePath = TempFilePath::create();
   auto baseFilePath = dataFilePath->getPath();
   writeDeleteFile(
+      DeleteFileFormat::DWRF,
       deleteFilePath->getPath(),
       {makeRowVector(
           {pathColumn->name, posColumn->name},
@@ -851,6 +857,7 @@ TEST_F(CudfIcebergReadTest, positionalDeleteSequenceNumberZeroDisablesFilter) {
   auto deleteFilePath = TempFilePath::create();
   auto baseFilePath = dataFilePath->getPath();
   writeDeleteFile(
+      DeleteFileFormat::DWRF,
       deleteFilePath->getPath(),
       {makeRowVector(
           {pathColumn->name, posColumn->name},

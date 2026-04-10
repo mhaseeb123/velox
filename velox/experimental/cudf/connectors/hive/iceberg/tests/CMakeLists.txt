@@ -21,6 +21,7 @@ target_link_libraries(
   velox_cudf_exec_test_lib
   velox_cudf_iceberg_connector
   velox_hive_iceberg_splitreader
+  velox_dwio_parquet_writer
   velox_exec_test_lib
   velox_test_util
 )

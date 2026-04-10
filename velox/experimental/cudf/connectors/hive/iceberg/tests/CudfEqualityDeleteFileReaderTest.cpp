@@ -35,11 +35,13 @@ using namespace facebook::velox::connector::hive::iceberg;
 
 namespace facebook::velox::cudf_velox::exec::test {
 
-class CudfEqualityDeleteFileReaderTest : public CudfIcebergTestBase {};
+class CudfEqualityDeleteFileReaderTest
+    : public CudfIcebergTestBase,
+      public ::testing::WithParamInterface<DeleteFileFormat> {};
 
 /// Basic single-column equality delete.
 /// (Ported from upstream EqualityDeleteFileReaderTest::basicSingleColumnDelete)
-TEST_F(CudfEqualityDeleteFileReaderTest, basicSingleColumnDelete) {
+TEST_P(CudfEqualityDeleteFileReaderTest, basicSingleColumnDelete) {
   folly::SingletonVault::singleton()->registrationComplete();
 
   auto rowType = ROW({"c0", "c1"}, {BIGINT(), BIGINT()});
@@ -55,12 +57,13 @@ TEST_F(CudfEqualityDeleteFileReaderTest, basicSingleColumnDelete) {
       makeFlatVector<int64_t>({3, 7}),
   });
   auto eqDeleteFile = TempFilePath::create();
-  writeDeleteFile(eqDeleteFile->getPath(), {deleteData});
+  const auto eqDeleteFileFormat = GetParam();
+  writeDeleteFile(eqDeleteFileFormat, eqDeleteFile->getPath(), {deleteData});
 
   IcebergDeleteFile icebergDeleteFile(
       FileContent::kEqualityDeletes,
       eqDeleteFile->getPath(),
-      dwio::common::FileFormat::DWRF,
+      toDwioFormat(eqDeleteFileFormat),
       2,
       getFileSize(eqDeleteFile->getPath()),
       /*equalityFieldIds=*/{1});
@@ -79,7 +82,7 @@ TEST_F(CudfEqualityDeleteFileReaderTest, basicSingleColumnDelete) {
 
 /// Multi-column equality deletes (both columns must match).
 /// (Ported from upstream EqualityDeleteFileReaderTest::multiColumnDelete)
-TEST_F(CudfEqualityDeleteFileReaderTest, multiColumnDelete) {
+TEST_P(CudfEqualityDeleteFileReaderTest, multiColumnDelete) {
   folly::SingletonVault::singleton()->registrationComplete();
 
   auto rowType = ROW({"c0", "c1", "c2"}, {INTEGER(), INTEGER(), BIGINT()});
@@ -97,12 +100,13 @@ TEST_F(CudfEqualityDeleteFileReaderTest, multiColumnDelete) {
       makeFlatVector<int32_t>({20, 20, 20}),
   });
   auto eqDeleteFile = TempFilePath::create();
-  writeDeleteFile(eqDeleteFile->getPath(), {deleteData});
+  const auto eqDeleteFileFormat = GetParam();
+  writeDeleteFile(eqDeleteFileFormat, eqDeleteFile->getPath(), {deleteData});
 
   IcebergDeleteFile icebergDeleteFile(
       FileContent::kEqualityDeletes,
       eqDeleteFile->getPath(),
-      dwio::common::FileFormat::DWRF,
+      toDwioFormat(eqDeleteFileFormat),
       3,
       getFileSize(eqDeleteFile->getPath()),
       /*equalityFieldIds=*/{1, 2});
@@ -122,7 +126,7 @@ TEST_F(CudfEqualityDeleteFileReaderTest, multiColumnDelete) {
 
 /// When no rows match, all rows survive.
 /// (Ported from upstream EqualityDeleteFileReaderTest::noMatchingDeletes)
-TEST_F(CudfEqualityDeleteFileReaderTest, noMatchingDeletes) {
+TEST_P(CudfEqualityDeleteFileReaderTest, noMatchingDeletes) {
   folly::SingletonVault::singleton()->registrationComplete();
 
   auto rowType = ROW({"c0"}, {BIGINT()});
@@ -137,12 +141,13 @@ TEST_F(CudfEqualityDeleteFileReaderTest, noMatchingDeletes) {
       makeFlatVector<int64_t>({100, 200}),
   });
   auto eqDeleteFile = TempFilePath::create();
-  writeDeleteFile(eqDeleteFile->getPath(), {deleteData});
+  const auto eqDeleteFileFormat = GetParam();
+  writeDeleteFile(eqDeleteFileFormat, eqDeleteFile->getPath(), {deleteData});
 
   IcebergDeleteFile icebergDeleteFile(
       FileContent::kEqualityDeletes,
       eqDeleteFile->getPath(),
-      dwio::common::FileFormat::DWRF,
+      toDwioFormat(eqDeleteFileFormat),
       2,
       getFileSize(eqDeleteFile->getPath()),
       /*equalityFieldIds=*/{1});
@@ -160,7 +165,7 @@ TEST_F(CudfEqualityDeleteFileReaderTest, noMatchingDeletes) {
 
 /// All rows deleted.
 /// (Ported from upstream EqualityDeleteFileReaderTest::allRowsDeleted)
-TEST_F(CudfEqualityDeleteFileReaderTest, allRowsDeleted) {
+TEST_P(CudfEqualityDeleteFileReaderTest, allRowsDeleted) {
   folly::SingletonVault::singleton()->registrationComplete();
 
   auto rowType = ROW({"c0"}, {BIGINT()});
@@ -175,12 +180,13 @@ TEST_F(CudfEqualityDeleteFileReaderTest, allRowsDeleted) {
       makeFlatVector<int64_t>({1, 2, 3}),
   });
   auto eqDeleteFile = TempFilePath::create();
-  writeDeleteFile(eqDeleteFile->getPath(), {deleteData});
+  const auto eqDeleteFileFormat = GetParam();
+  writeDeleteFile(eqDeleteFileFormat, eqDeleteFile->getPath(), {deleteData});
 
   IcebergDeleteFile icebergDeleteFile(
       FileContent::kEqualityDeletes,
       eqDeleteFile->getPath(),
-      dwio::common::FileFormat::DWRF,
+      toDwioFormat(eqDeleteFileFormat),
       3,
       getFileSize(eqDeleteFile->getPath()),
       /*equalityFieldIds=*/{1});
@@ -195,7 +201,7 @@ TEST_F(CudfEqualityDeleteFileReaderTest, allRowsDeleted) {
 /// Equality deletes with higher sequence number should apply.
 /// (Ported from upstream
 /// EqualityDeleteFileReaderTest::sequenceNumberDeleteApplies)
-TEST_F(CudfEqualityDeleteFileReaderTest, sequenceNumberDeleteApplies) {
+TEST_P(CudfEqualityDeleteFileReaderTest, sequenceNumberDeleteApplies) {
   folly::SingletonVault::singleton()->registrationComplete();
 
   auto rowType = ROW({"c0", "c1"}, {BIGINT(), BIGINT()});
@@ -211,12 +217,13 @@ TEST_F(CudfEqualityDeleteFileReaderTest, sequenceNumberDeleteApplies) {
       makeFlatVector<int64_t>({2, 4}),
   });
   auto eqDeleteFile = TempFilePath::create();
-  writeDeleteFile(eqDeleteFile->getPath(), {deleteData});
+  const auto eqDeleteFileFormat = GetParam();
+  writeDeleteFile(eqDeleteFileFormat, eqDeleteFile->getPath(), {deleteData});
 
   IcebergDeleteFile icebergDeleteFile(
       FileContent::kEqualityDeletes,
       eqDeleteFile->getPath(),
-      dwio::common::FileFormat::DWRF,
+      toDwioFormat(eqDeleteFileFormat),
       2,
       getFileSize(eqDeleteFile->getPath()),
       /*equalityFieldIds=*/{1},
@@ -244,7 +251,7 @@ TEST_F(CudfEqualityDeleteFileReaderTest, sequenceNumberDeleteApplies) {
 /// Equality deletes with lower sequence number should be skipped.
 /// (Ported from upstream
 /// EqualityDeleteFileReaderTest::sequenceNumberDeleteSkipped)
-TEST_F(CudfEqualityDeleteFileReaderTest, sequenceNumberDeleteSkipped) {
+TEST_P(CudfEqualityDeleteFileReaderTest, sequenceNumberDeleteSkipped) {
   folly::SingletonVault::singleton()->registrationComplete();
 
   auto rowType = ROW({"c0", "c1"}, {BIGINT(), BIGINT()});
@@ -260,12 +267,13 @@ TEST_F(CudfEqualityDeleteFileReaderTest, sequenceNumberDeleteSkipped) {
       makeFlatVector<int64_t>({1, 2, 3}),
   });
   auto eqDeleteFile = TempFilePath::create();
-  writeDeleteFile(eqDeleteFile->getPath(), {deleteData});
+  const auto eqDeleteFileFormat = GetParam();
+  writeDeleteFile(eqDeleteFileFormat, eqDeleteFile->getPath(), {deleteData});
 
   IcebergDeleteFile icebergDeleteFile(
       FileContent::kEqualityDeletes,
       eqDeleteFile->getPath(),
-      dwio::common::FileFormat::DWRF,
+      toDwioFormat(eqDeleteFileFormat),
       3,
       getFileSize(eqDeleteFile->getPath()),
       /*equalityFieldIds=*/{1},
@@ -293,7 +301,7 @@ TEST_F(CudfEqualityDeleteFileReaderTest, sequenceNumberDeleteSkipped) {
 /// Equal sequence numbers should also skip.
 /// (Ported from upstream
 /// EqualityDeleteFileReaderTest::sequenceNumberEqualSkipped)
-TEST_F(CudfEqualityDeleteFileReaderTest, sequenceNumberEqualSkipped) {
+TEST_P(CudfEqualityDeleteFileReaderTest, sequenceNumberEqualSkipped) {
   folly::SingletonVault::singleton()->registrationComplete();
 
   auto rowType = ROW({"c0"}, {BIGINT()});
@@ -308,12 +316,13 @@ TEST_F(CudfEqualityDeleteFileReaderTest, sequenceNumberEqualSkipped) {
       makeFlatVector<int64_t>({1, 2, 3}),
   });
   auto eqDeleteFile = TempFilePath::create();
-  writeDeleteFile(eqDeleteFile->getPath(), {deleteData});
+  const auto eqDeleteFileFormat = GetParam();
+  writeDeleteFile(eqDeleteFileFormat, eqDeleteFile->getPath(), {deleteData});
 
   IcebergDeleteFile icebergDeleteFile(
       FileContent::kEqualityDeletes,
       eqDeleteFile->getPath(),
-      dwio::common::FileFormat::DWRF,
+      toDwioFormat(eqDeleteFileFormat),
       3,
       getFileSize(eqDeleteFile->getPath()),
       /*equalityFieldIds=*/{1},
@@ -340,7 +349,7 @@ TEST_F(CudfEqualityDeleteFileReaderTest, sequenceNumberEqualSkipped) {
 /// Sequence number 0 means legacy/unassigned — always apply.
 /// (Ported from upstream
 /// EqualityDeleteFileReaderTest::sequenceNumberZeroAlwaysApplies)
-TEST_F(CudfEqualityDeleteFileReaderTest, sequenceNumberZeroAlwaysApplies) {
+TEST_P(CudfEqualityDeleteFileReaderTest, sequenceNumberZeroAlwaysApplies) {
   folly::SingletonVault::singleton()->registrationComplete();
 
   auto rowType = ROW({"c0"}, {BIGINT()});
@@ -355,12 +364,13 @@ TEST_F(CudfEqualityDeleteFileReaderTest, sequenceNumberZeroAlwaysApplies) {
       makeFlatVector<int64_t>({2}),
   });
   auto eqDeleteFile = TempFilePath::create();
-  writeDeleteFile(eqDeleteFile->getPath(), {deleteData});
+  const auto eqDeleteFileFormat = GetParam();
+  writeDeleteFile(eqDeleteFileFormat, eqDeleteFile->getPath(), {deleteData});
 
   IcebergDeleteFile icebergDeleteFile(
       FileContent::kEqualityDeletes,
       eqDeleteFile->getPath(),
-      dwio::common::FileFormat::DWRF,
+      toDwioFormat(eqDeleteFileFormat),
       1,
       getFileSize(eqDeleteFile->getPath()),
       /*equalityFieldIds=*/{1},
@@ -386,7 +396,7 @@ TEST_F(CudfEqualityDeleteFileReaderTest, sequenceNumberZeroAlwaysApplies) {
 
 /// Mixed sequence numbers: only delete files with higher seqNum apply.
 /// (Ported from upstream EqualityDeleteFileReaderTest::mixedSequenceNumbers)
-TEST_F(CudfEqualityDeleteFileReaderTest, mixedSequenceNumbers) {
+TEST_P(CudfEqualityDeleteFileReaderTest, mixedSequenceNumbers) {
   folly::SingletonVault::singleton()->registrationComplete();
 
   auto rowType = ROW({"c0", "c1"}, {BIGINT(), BIGINT()});
@@ -398,15 +408,17 @@ TEST_F(CudfEqualityDeleteFileReaderTest, mixedSequenceNumbers) {
   auto dataFile = TempFilePath::create();
   writeToFile(dataFile->getPath(), baseData);
 
+  const auto eqDeleteFileFormat = GetParam();
+
   auto deleteData1 = makeRowVector({
       makeFlatVector<int64_t>({2}),
   });
   auto eqDeleteFile1 = TempFilePath::create();
-  writeDeleteFile(eqDeleteFile1->getPath(), {deleteData1});
+  writeDeleteFile(eqDeleteFileFormat, eqDeleteFile1->getPath(), {deleteData1});
   IcebergDeleteFile icebergDeleteFile1(
       FileContent::kEqualityDeletes,
       eqDeleteFile1->getPath(),
-      dwio::common::FileFormat::DWRF,
+      toDwioFormat(eqDeleteFileFormat),
       1,
       getFileSize(eqDeleteFile1->getPath()),
       /*equalityFieldIds=*/{1},
@@ -418,11 +430,11 @@ TEST_F(CudfEqualityDeleteFileReaderTest, mixedSequenceNumbers) {
       makeFlatVector<int64_t>({4}),
   });
   auto eqDeleteFile2 = TempFilePath::create();
-  writeDeleteFile(eqDeleteFile2->getPath(), {deleteData2});
+  writeDeleteFile(eqDeleteFileFormat, eqDeleteFile2->getPath(), {deleteData2});
   IcebergDeleteFile icebergDeleteFile2(
       FileContent::kEqualityDeletes,
       eqDeleteFile2->getPath(),
-      dwio::common::FileFormat::DWRF,
+      toDwioFormat(eqDeleteFileFormat),
       1,
       getFileSize(eqDeleteFile2->getPath()),
       /*equalityFieldIds=*/{1},
@@ -442,6 +454,72 @@ TEST_F(CudfEqualityDeleteFileReaderTest, mixedSequenceNumbers) {
   auto expected = makeRowVector({
       makeFlatVector<int64_t>({1, 3, 4, 5}),
       makeFlatVector<int64_t>({10, 30, 40, 50}),
+  });
+
+  assertEqualResults({expected}, {result});
+}
+
+/// Mixed-format test (not parameterized)
+
+INSTANTIATE_TEST_SUITE_P(
+    DeleteFormats,
+    CudfEqualityDeleteFileReaderTest,
+    ::testing::Values(DeleteFileFormat::DWRF, DeleteFileFormat::PARQUET),
+    [](const auto& info) {
+      return info.param == DeleteFileFormat::PARQUET ? "Parquet" : "Dwrf";
+    });
+
+class CudfMixedFormatEqualityDeleteTest : public CudfIcebergTestBase {};
+
+/// Mixed delete file formats: one DWRF and one Parquet equality delete file.
+TEST_F(CudfMixedFormatEqualityDeleteTest, mixedFormatDeleteFiles) {
+  folly::SingletonVault::singleton()->registrationComplete();
+
+  auto rowType = ROW({"c0", "c1"}, {BIGINT(), BIGINT()});
+
+  auto baseData = makeRowVector({
+      makeFlatVector<int64_t>({1, 2, 3, 4, 5}),
+      makeFlatVector<int64_t>({10, 20, 30, 40, 50}),
+  });
+  auto dataFile = TempFilePath::create();
+  writeToFile(dataFile->getPath(), baseData);
+
+  auto deleteData1 = makeRowVector({
+      makeFlatVector<int64_t>({2}),
+  });
+  auto eqDeleteFile1 = TempFilePath::create();
+  writeDeleteFile(
+      DeleteFileFormat::DWRF, eqDeleteFile1->getPath(), {deleteData1});
+  IcebergDeleteFile icebergDeleteFile1(
+      FileContent::kEqualityDeletes,
+      eqDeleteFile1->getPath(),
+      dwio::common::FileFormat::DWRF,
+      1,
+      getFileSize(eqDeleteFile1->getPath()),
+      /*equalityFieldIds=*/{1});
+
+  auto deleteData2 = makeRowVector({
+      makeFlatVector<int64_t>({4}),
+  });
+  auto eqDeleteFile2 = TempFilePath::create();
+  writeDeleteFile(
+      DeleteFileFormat::PARQUET, eqDeleteFile2->getPath(), {deleteData2});
+  IcebergDeleteFile icebergDeleteFile2(
+      FileContent::kEqualityDeletes,
+      eqDeleteFile2->getPath(),
+      dwio::common::FileFormat::PARQUET,
+      1,
+      getFileSize(eqDeleteFile2->getPath()),
+      /*equalityFieldIds=*/{1});
+
+  auto splits = makeIcebergSplits(
+      dataFile->getPath(), {icebergDeleteFile1, icebergDeleteFile2});
+  auto plan = makeTableScanPlan(rowType);
+  auto result = AssertQueryBuilder(plan).splits(splits).copyResults(pool());
+
+  auto expected = makeRowVector({
+      makeFlatVector<int64_t>({1, 3, 5}),
+      makeFlatVector<int64_t>({10, 30, 50}),
   });
 
   assertEqualResults({expected}, {result});
