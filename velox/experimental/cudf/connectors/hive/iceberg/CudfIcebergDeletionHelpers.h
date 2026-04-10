@@ -22,13 +22,14 @@
 
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
+#include <rmm/device_uvector.hpp>
 #include <rmm/resource_ref.hpp>
 
 #include <memory>
 
 namespace facebook::velox::cudf_velox::connector::hive::iceberg {
 
-/// GPU-side helper: Transforms the host deletion bitmap to a device surviving
+/// Transforms the host deletion bitmap to a device surviving
 /// row mask, applies it to the input table, returning the new output table.
 std::unique_ptr<cudf::table> applyDeleteBitmap(
     cudf::table_view input,
@@ -38,5 +39,12 @@ std::unique_ptr<cudf::table> applyDeleteBitmap(
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref temp_mr,
     rmm::device_async_resource_ref output_mr);
+
+/// Applies the deletion mask from `cudf::detail::contains` to the input
+/// surviving row mask
+void applyDeleteMaskToRowMask(
+    std::shared_ptr<rmm::device_buffer> rowMask,
+    cudf::device_span<bool const> deleteMask,
+    rmm::cuda_stream_view stream);
 
 } // namespace facebook::velox::cudf_velox::connector::hive::iceberg

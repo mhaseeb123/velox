@@ -16,16 +16,31 @@
 
 #pragma once
 
-#include <cudf/ast/expressions.hpp>
+#include "velox/connectors/Connector.h"
+#include "velox/connectors/hive/FileHandle.h"
+#include "velox/connectors/hive/HiveConfig.h"
+#include "velox/connectors/hive/iceberg/IcebergDeleteFile.h"
+#include "velox/dwio/common/Statistics.h"
+#include "velox/vector/ComplexVector.h"
+
+#include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
+#include <cudf/types.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
+#include <rmm/resource_ref.hpp>
 
-#include "velox/connectors/hive/iceberg/EqualityDeleteFileReader.h"
+#include <folly/Executor.h>
+
+#include <cstddef>
+#include <memory>
+#include <string>
+#include <vector>
 
 namespace facebook::velox::cudf_velox::connector::hive::iceberg {
 
+namespace velox_connector = ::facebook::velox::connector;
 namespace velox_iceberg = ::facebook::velox::connector::hive::iceberg;
 namespace velox_hive = ::facebook::velox::connector::hive;
 
@@ -36,20 +51,18 @@ namespace velox_hive = ::facebook::velox::connector::hive;
 /// columns (identified by equalityFieldIds). A base data row is deleted if
 /// its values match ALL specified columns of ANY row in the delete file.
 ///
-/// Unlike positional deletes (which set bits before reading), equality deletes
-/// require reading the base data first, then probing each row against the
-/// delete set. The reader eagerly loads all delete key tuples from the file
-/// into an in-memory hash set during construction via the upstream reader.
-///
-/// The equality delete column names are resolved from equalityFieldIds via
-/// the table schema provided by the caller.
+/// The delete file is read eagerly on CPU during construction and stored as
+/// a Velox RowVector. On the first call to applyDeletes(), the delete rows
+/// are lazily converted to a GPU-resident cudf table. Subsequent calls to
+/// applyDeletes() reuse the cached cudf table. The actual row matching is
+/// performed by cudf::detail::contains which builds a cuco::static_set
+/// internally.
 class CudfEqualityDeleteFileReader {
  public:
   /// Constructs a reader for a single equality delete file.
   ///
-  /// Eagerly reads the entire delete file via the upstream
-  /// EqualityDeleteFileReader and builds an in-memory hash set of delete key
-  /// tuples. The delete file is fully consumed during construction.
+  /// Eagerly reads the entire delete file into a Velox RowVector. The delete
+  /// file is fully consumed during construction.
   ///
   /// @param deleteFile Metadata about the equality delete file. Must have
   ///   content == FileContent::kEqualityDeletes and non-empty
@@ -73,52 +86,76 @@ class CudfEqualityDeleteFileReader {
       const std::vector<TypePtr>& equalityColumnTypes,
       const std::string& baseFilePath,
       FileHandleFactory* fileHandleFactory,
-      const ConnectorQueryCtx* connectorQueryCtx,
+      const velox_connector::ConnectorQueryCtx* connectorQueryCtx,
       folly::Executor* executor,
       const std::shared_ptr<const velox_hive::HiveConfig>& hiveConfig,
-      const std::shared_ptr<io::IoStatistics>& ioStatistics,
-      const std::shared_ptr<IoStats>& ioStats,
-      dwio::common::RuntimeStatistics& runtimeStats,
+      const std::shared_ptr<::facebook::velox::io::IoStatistics>& ioStatistics,
+      const std::shared_ptr<::facebook::velox::IoStats>& ioStats,
+      ::facebook::velox::dwio::common::RuntimeStatistics& runtimeStats,
       const std::string& connectorId);
 
-  /// Applies equality deletes to a GPU table by marking deleted rows in the
-  /// row mask. Rows whose equality column values match any delete key tuple
-  /// are marked as deleted.
+  /// Applies equality deletes to the output CudfVector by clearing the
+  /// row mask for rows whose equality column values match any delete key tuple.
   ///
-  /// @param table The cudf table view to filter.
-  /// @param rowMask Device buffer of booleans; rows not deleted are marked
-  ///   true.
+  /// On the first call, lazily converts the Velox delete rows to a cudf
+  /// table on GPU.
+  ///
+  /// @param table Base cudf table view to filter.
+  /// @param inputColumnNames Column names of the input table, used to
+  ///   resolve equality column indices.
+  /// @param rowMask Device buffer of booleans; surviving rows are true.
   /// @param stream CUDA stream for kernel launches.
+  /// @param mr Device memory resource for temporary allocations.
   void applyDeletes(
       cudf::table_view table,
+      const std::vector<std::string>& inputColumnNames,
       std::shared_ptr<rmm::device_buffer> rowMask,
-      rmm::cuda_stream_view stream);
-
-  /// Applies equality deletes to the output vector by setting bits in the
-  /// delete bitmap for rows whose equality column values match any delete
-  /// key tuple. Delegates to the upstream reader.
-  ///
-  /// @param output The base data output vector to filter.
-  /// @param deleteBitmap Output bitmap. Bit i is set if row i matches an
-  ///   equality delete.
-  void applyDeletes(const RowVectorPtr& output, BufferPtr deleteBitmap);
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr);
 
   /// Returns the number of delete key tuples loaded from the file.
-  size_t numDeleteKeys() const;
+  size_t numDeleteKeys() const {
+    return numDeleteKeys_;
+  }
 
-  /// Returns true if no delete keys were loaded (file was skipped or empty).
-  /// When true, applyDeletes() is a no-op.
-  bool empty() const;
+  /// Returns true if this reader has no delete keys (file was skipped or
+  /// empty). When true, applyDeletes() is a no-op.
+  bool empty() const {
+    return numDeleteKeys_ == 0;
+  }
 
  private:
-  // Upstream reader used to read the delete file and apply deletes on CPU.
-  std::unique_ptr<velox_iceberg::EqualityDeleteFileReader> upstreamReader_;
+  /// Lazily converts the deleteRows_ to a cudf table at the first
+  /// `applyDeletes` call
+  void buildDeleteKeyTable(
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr);
 
-  // Column names for equality comparison.
+  /// Lazily constructs the equality column indices in the input table
+  /// on the first call to applyDeletes().
+  void buildEqualityColumnIndices(
+      const std::vector<std::string>& inputColumnNames);
+
+  /// Column names and types for equality delete comparison.
   std::vector<std::string> equalityColumnNames_;
 
-  // Column types for equality comparison.
-  std::vector<TypePtr> equalityColumnTypes_;
+  /// Number of delete key tuples loaded from the file.
+  size_t numDeleteKeys_;
+
+  /// All rows read from the equality delete file, stored for equality
+  /// comparison during probing.
+  RowVectorPtr deleteRows_;
+
+  /// Cudf table containing the delete key tuples.
+  std::unique_ptr<cudf::table> deleteKeyTable_;
+
+  /// Equality column indices in the input table
+  std::vector<cudf::size_type> equalityColumnIndices_;
+
+  /// Whether the delete key table and equality column indices have been loaded.
+  bool isLoaded_{false};
+
+  memory::MemoryPool* pool_;
 };
 
 } // namespace facebook::velox::cudf_velox::connector::hive::iceberg
