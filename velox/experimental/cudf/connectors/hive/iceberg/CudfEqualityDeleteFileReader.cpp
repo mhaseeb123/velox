@@ -257,7 +257,8 @@ void CudfEqualityDeleteFileReader::applyDeletes(
     scatterDeletesToRowMask(
         cudf::device_span<bool>(static_cast<bool*>(rowMask->data()), numRows),
         *probeIndices,
-        stream);
+        stream,
+        get_temp_mr());
   }
 }
 

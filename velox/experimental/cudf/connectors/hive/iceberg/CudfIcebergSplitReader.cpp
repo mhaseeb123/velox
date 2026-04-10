@@ -385,15 +385,25 @@ std::unique_ptr<cudf::table> CudfIcebergSplitReader::applyPositionalDeletes(
       cudaMemcpyHostToDevice,
       stream_.value()));
 
-  return applyDeleteBitmap(
-      input,
+  // Convert the deletion bitmap to a surviving row mask
+  convertDeletionBitmapToRowMask(
       cudf::device_span<cudf::bitmask_type>(
           static_cast<cudf::bitmask_type*>(deviceDeleteBitmap_->data()),
           numWords),
       cudf::device_span<bool>(static_cast<bool*>(rowMask_->data()), numRows),
       stream_,
-      get_temp_mr(),
-      output_mr);
+      get_temp_mr());
+
+  // Convert the row mask to a column view and apply the boolean mask to
+  // the input table
+  auto rowMaskCol = cudf::column_view(
+      cudf::data_type{cudf::type_id::BOOL8},
+      numRows,
+      rowMask_->data(),
+      nullptr,
+      0,
+      0);
+  return cudf::apply_boolean_mask(input, rowMaskCol, stream_, output_mr);
 }
 
 std::unique_ptr<cudf::table> CudfIcebergSplitReader::applyEqualityDeletes(
@@ -421,7 +431,6 @@ std::unique_ptr<cudf::table> CudfIcebergSplitReader::applyEqualityDeletes(
       nullptr,
       0,
       0);
-
   return cudf::apply_boolean_mask(input, rowMaskCol, stream_, output_mr);
 }
 

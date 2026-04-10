@@ -32,8 +32,8 @@ namespace facebook::velox::cudf_velox::connector::hive::iceberg {
 
 namespace {
 
-/// Functor that returns true when the bit at `index` is clear. i.e., the row
-/// is NOT deleted and should survive.
+/// Functor to check if the bit at `index` is clear. i.e., the row
+/// is NOT deleted.
 struct IsSurvivingRow {
   const cudf::bitmask_type* bitmask;
   __device__ bool operator()(cudf::size_type index) const noexcept {
@@ -43,44 +43,29 @@ struct IsSurvivingRow {
 
 } // namespace
 
-std::unique_ptr<cudf::table> applyDeleteBitmap(
-    cudf::table_view input,
+void convertDeletionBitmapToRowMask(
     cudf::device_span<cudf::bitmask_type const> deviceBitmap,
     cudf::device_span<bool> rowMask,
     rmm::cuda_stream_view stream,
-    rmm::device_async_resource_ref temp_mr,
-    rmm::device_async_resource_ref output_mr) {
-  const auto numRows = input.num_rows();
-
-  // Transform the deletion bitmap to the surviving row mask inplace
+    rmm::device_async_resource_ref temp_mr) {
   // Alternate: Use `cudf::mask_to_bools` but it produces a new column.
+  auto iter = cuda::counting_iterator{0};
   thrust::transform(
       rmm::exec_policy_nosync(stream, temp_mr),
-      cuda::counting_iterator<cudf::size_type>{0},
-      cuda::counting_iterator<cudf::size_type>{numRows},
+      iter,
+      iter + rowMask.size(),
       rowMask.begin(),
       IsSurvivingRow{deviceBitmap.data()});
-
-  // Convert the surviving row mask to a column view
-  auto rowMaskCol = cudf::column_view(
-      cudf::data_type{cudf::type_id::BOOL8},
-      numRows,
-      rowMask.data(),
-      nullptr,
-      0,
-      0);
-
-  // Apply the boolean mask to the input table
-  return cudf::apply_boolean_mask(input, rowMaskCol, stream, output_mr);
 }
 
 void scatterDeletesToRowMask(
     cudf::device_span<bool> rowMask,
     cudf::device_span<cudf::size_type const> indices,
-    rmm::cuda_stream_view stream) {
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref temp_mr) {
   auto iter = cuda::constant_iterator<bool>(false);
   thrust::scatter(
-      rmm::exec_policy_nosync(stream),
+      rmm::exec_policy_nosync(stream, temp_mr),
       iter,
       iter + indices.size(),
       indices.begin(),
