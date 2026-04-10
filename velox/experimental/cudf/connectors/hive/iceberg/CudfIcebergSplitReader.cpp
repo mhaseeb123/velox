@@ -387,22 +387,21 @@ std::unique_ptr<cudf::table> CudfIcebergSplitReader::applyPositionalDeletes(
 std::unique_ptr<cudf::table> CudfIcebergSplitReader::applyEqualityDeletes(
     cudf::table_view input,
     rmm::device_async_resource_ref output_mr) {
+  // Reset the row mask to all-true to start
   const auto numRows = input.num_rows();
-
-  // Reset the row mask to all-true
   VELOX_CHECK_NOT_NULL(rowMask_->data());
   VELOX_CHECK_GE(rowMask_->size(), static_cast<size_t>(numRows));
   CUDF_CUDA_TRY(cudaMemsetAsync(
       rowMask_->data(), true, numRows * sizeof(bool), stream_.value()));
 
-  // Apply equality deletes, if any
+  // Iteratively apply equality deletes, if any
   for (auto& reader : equalityDeleteFileReaders_) {
     reader->applyDeletes(
         input, readColumnNames_, rowMask_, stream_, get_temp_mr());
   }
 
-  // Convert the row mask to a column view and apply the boolean mask to the
-  // input table
+  // Convert the final row mask to a column view and apply the boolean mask to
+  // the input table
   auto rowMaskCol = cudf::column_view(
       cudf::data_type{cudf::type_id::BOOL8},
       numRows,

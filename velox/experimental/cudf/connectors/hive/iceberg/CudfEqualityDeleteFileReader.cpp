@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "velox/experimental/cudf/CudfNoDefaults.h"
 #include "velox/experimental/cudf/connectors/hive/CudfSplitReaderHelpers.h"
 #include "velox/experimental/cudf/connectors/hive/iceberg/CudfEqualityDeleteFileReader.h"
 #include "velox/experimental/cudf/connectors/hive/iceberg/CudfIcebergDeletionHelpers.h"
@@ -28,8 +29,8 @@
 #include "velox/connectors/hive/iceberg/IcebergMetadataColumns.h"
 #include "velox/dwio/common/ReaderFactory.h"
 
-#include <cudf/detail/search.hpp>
 #include <cudf/io/parquet.hpp>
+#include <cudf/join/distinct_hash_join.hpp>
 #include <cudf/types.hpp>
 
 #include <limits>
@@ -182,19 +183,26 @@ void CudfEqualityDeleteFileReader::directReadEqualityDeleteFile(
   numDeleteKeys_ = deleteKeyTable_->num_rows();
 }
 
-void CudfEqualityDeleteFileReader::buildDeleteKeyTable(
-    rmm::cuda_stream_view stream,
-    rmm::device_async_resource_ref mr) {
-  if (deleteKeyTable_) {
+void CudfEqualityDeleteFileReader::buildHashJoin(rmm::cuda_stream_view stream) {
+  if (deleteHashJoin_) {
     return;
   }
 
-  VELOX_CHECK_NOT_NULL(deleteRows_);
-  deleteKeyTable_ = with_arrow::toCudfTable(deleteRows_, pool_, stream, mr);
-  VELOX_CHECK_NOT_NULL(deleteKeyTable_);
+  // Convert host rows to a GPU table if we came through the non-Parquet path.
+  if (!deleteKeyTable_) {
+    VELOX_CHECK_NOT_NULL(deleteRows_);
+    deleteKeyTable_ =
+        with_arrow::toCudfTable(deleteRows_, pool_, stream, get_temp_mr());
+    VELOX_CHECK_NOT_NULL(deleteKeyTable_);
+    deleteRows_.reset();
+  }
 
-  // Free host memory now that we have the GPU copy.
-  deleteRows_.reset();
+  // null_equality::EQUAL per Iceberg spec (NULL == NULL for equality deletes).
+  // distinct_hash_join treats all NaNs as equal by default.
+  deleteHashJoin_ = std::make_unique<cudf::distinct_hash_join>(
+      deleteKeyTable_->view(), cudf::null_equality::EQUAL, 0.5, stream);
+
+  deleteKeyTable_.reset();
 }
 
 void CudfEqualityDeleteFileReader::buildEqualityColumnIndices(
@@ -232,24 +240,21 @@ void CudfEqualityDeleteFileReader::applyDeletes(
     return;
   }
 
-  buildDeleteKeyTable(stream, mr);
+  // Lazily build hash join and equality column indices if needed
+  buildHashJoin(stream);
   buildEqualityColumnIndices(inputColumnNames);
 
-  // `cudf::detail::contains` returns a device vector of bools containing `true`
-  // if the probe row exists in the delete key table. We use
-  // null_equality::EQUAL per Iceberg spec (NULL == NULL for equality deletes).
+  // Use hash join to find probe indices that match any delete key.
+  // inner_join returns (probeIndices, buildindices); we only need the probe
+  // side to know which data rows to delete.
   const auto probeTable = table.select(equalityColumnIndices_);
-  const auto deleteMask = cudf::detail::contains(
-      deleteKeyTable_->view(),
-      probeTable,
-      cudf::null_equality::EQUAL,
-      cudf::nan_equality::ALL_EQUAL,
-      stream,
-      mr);
+  const auto probeIndices =
+      deleteHashJoin_->inner_join(probeTable, stream, mr).first;
 
-  // Apply the deletion mask (result from cudf::detail::contains) to the row
-  // mask: clear rowMask where rows match.
-  applyDeleteMaskToRowMask(rowMask, deleteMask, stream);
+  // Clear `rowMask` at probe positions if any
+  if (not probeIndices->is_empty()) {
+    applyDeletePositions(rowMask, table.num_rows(), *probeIndices, stream);
+  }
 }
 
 } // namespace facebook::velox::cudf_velox::connector::hive::iceberg

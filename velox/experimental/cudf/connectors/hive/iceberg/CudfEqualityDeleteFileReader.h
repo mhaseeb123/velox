@@ -24,6 +24,7 @@
 #include "velox/vector/ComplexVector.h"
 
 #include <cudf/io/datasource.hpp>
+#include <cudf/join/distinct_hash_join.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
@@ -55,9 +56,11 @@ namespace velox_hive = ::facebook::velox::connector::hive;
 /// Unlike positional deletes (which set bits before reading), equality deletes
 /// require reading the base data first, then probing each row against the
 /// delete set. The reader eagerly loads all delete key tuples from the file
-/// into a CPU or GPU table (for Parquet formats only) during construction. CPU
-/// table, if exists, is lazily converted to a GPU table on the first call to
-/// applyDeletes() and applied to the base data.
+/// into a CPU or GPU table (for Parquet formats only) during construction.
+/// A `cudf::distinct_hash_join` is lazily built on the first call to
+/// applyDeletes() after CPU to GPU table conversion if needed. The tables are
+/// freed after construction and the hash join is reused across batches for
+/// efficient anti-join probing.
 ///
 /// The equality delete column names are resolved from equalityFieldIds via
 /// the table schema provided by the caller.
@@ -129,14 +132,12 @@ class CudfEqualityDeleteFileReader {
   }
 
  private:
-  /// Lazily converts the deleteRows_ to the deleteKeyTable_ cudf table at the
-  /// first `applyDeletes` call
-  void buildDeleteKeyTable(
-      rmm::cuda_stream_view stream,
-      rmm::device_async_resource_ref mr);
+  /// Lazily builds the distinct_hash_join on the first `applyDeletes` call.
+  /// Converts `deleteRows_` to a GPU table if needed.
+  void buildHashJoin(rmm::cuda_stream_view stream);
 
   /// Eagerly reads the Parquet-format equality delete file into the
-  /// deleteKeyTable_ cudf table
+  /// deleteKeyTable_ cudf table.
   void directReadEqualityDeleteFile(
       const velox_iceberg::IcebergDeleteFile& deleteFile,
       std::shared_ptr<dwio::common::BufferedInput> bufferedInput);
@@ -152,12 +153,13 @@ class CudfEqualityDeleteFileReader {
   /// Number of delete key tuples loaded from the file.
   size_t numDeleteKeys_;
 
-  /// All rows read from the equality delete file, stored for equality
-  /// comparison during probing.
+  /// Transient CPU and GPU tables containing all rows read from the equality
+  /// delete file, used for equality comparison during probing.
   RowVectorPtr deleteRows_;
-
-  /// Cudf table containing the delete key tuples.
   std::unique_ptr<cudf::table> deleteKeyTable_;
+
+  /// Hash join object built once from deleteKeyTable_ and probed per-batch.
+  std::unique_ptr<cudf::distinct_hash_join> deleteHashJoin_;
 
   /// Equality column indices in the input table
   std::vector<cudf::size_type> equalityColumnIndices_;

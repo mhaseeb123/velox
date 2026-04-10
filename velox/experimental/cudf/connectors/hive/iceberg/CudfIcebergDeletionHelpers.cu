@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "velox/experimental/cudf/CudfNoDefaults.h"
 #include "velox/experimental/cudf/connectors/hive/iceberg/CudfIcebergDeletionHelpers.h"
 
 #include <cudf/null_mask.hpp>
@@ -25,6 +26,7 @@
 #include <rmm/exec_policy.hpp>
 
 #include <cuda/iterator>
+#include <thrust/scatter.h>
 #include <thrust/transform.h>
 
 namespace facebook::velox::cudf_velox::connector::hive::iceberg {
@@ -37,14 +39,6 @@ struct IsSurvivingRow {
   const cudf::bitmask_type* bitmask;
   __device__ bool operator()(cudf::size_type index) const noexcept {
     return not cudf::bit_is_set(bitmask, index);
-  }
-};
-
-/// Functor to update the row mask such that a row survives only if it was
-/// already surviving AND was NOT found in the delete set.
-struct IsSurvivingAndNotDeleted {
-  __device__ bool operator()(bool surviving, bool isDeleted) const noexcept {
-    return surviving and not isDeleted;
   }
 };
 
@@ -92,20 +86,17 @@ std::unique_ptr<cudf::table> applyDeleteBitmap(
   return cudf::apply_boolean_mask(input, rowMaskCol, stream, output_mr);
 }
 
-void applyDeleteMaskToRowMask(
+void applyDeletePositions(
     std::shared_ptr<rmm::device_buffer> rowMask,
-    cudf::device_span<bool const> deleteMask,
+    cudf::size_type numRows,
+    cudf::device_span<cudf::size_type const> indices,
     rmm::cuda_stream_view stream) {
-  auto rowMaskIter = static_cast<bool*>(rowMask->data());
-  auto const numRows = static_cast<cudf::size_type>(deleteMask.size());
-
-  thrust::transform(
+  thrust::scatter(
       rmm::exec_policy_nosync(stream),
-      rowMaskIter,
-      rowMaskIter + numRows,
-      deleteMask.begin(),
-      rowMaskIter,
-      IsSurvivingAndNotDeleted{});
+      cuda::constant_iterator<bool>(false),
+      cuda::constant_iterator<bool>(false) + indices.size(),
+      indices.begin(),
+      static_cast<bool*>(rowMask->data()));
 }
 
 } // namespace facebook::velox::cudf_velox::connector::hive::iceberg

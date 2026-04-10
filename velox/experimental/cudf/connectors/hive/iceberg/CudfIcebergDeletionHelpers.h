@@ -19,10 +19,10 @@
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
+#include <cudf/utilities/span.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
-#include <rmm/device_uvector.hpp>
 #include <rmm/resource_ref.hpp>
 
 #include <memory>
@@ -40,11 +40,12 @@ std::unique_ptr<cudf::table> applyDeleteBitmap(
     rmm::device_async_resource_ref temp_mr,
     rmm::device_async_resource_ref output_mr);
 
-/// Applies the deletion mask from `cudf::detail::contains` to the input
-/// surviving row mask
-void applyDeleteMaskToRowMask(
+/// Clears the surviving row mask at positions identified by matchedIndices
+/// (anti-join semantics: matched rows are deleted).
+void applyDeletePositions(
     std::shared_ptr<rmm::device_buffer> rowMask,
-    cudf::device_span<bool const> deleteMask,
+    cudf::size_type numRows,
+    cudf::device_span<cudf::size_type const> matchedIndices,
     rmm::cuda_stream_view stream);
 
 } // namespace facebook::velox::cudf_velox::connector::hive::iceberg
