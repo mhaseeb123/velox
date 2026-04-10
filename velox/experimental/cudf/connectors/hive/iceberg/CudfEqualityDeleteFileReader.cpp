@@ -202,7 +202,11 @@ void CudfEqualityDeleteFileReader::buildHashJoin(rmm::cuda_stream_view stream) {
   deleteHashJoin_ = std::make_unique<cudf::distinct_hash_join>(
       deleteKeyTable_->view(), cudf::null_equality::EQUAL, 0.5, stream);
 
-  deleteKeyTable_.reset();
+  // NOTE: Do NOT reset deleteKeyTable_ here. distinct_hash_join stores a
+  // view (reference) to the build table, not a copy. Destroying the table
+  // would leave the hash join with a dangling reference, causing incorrect
+  // results for multi-column keys (the probe needs the original column data
+  // to verify matches after hash collisions).
 }
 
 void CudfEqualityDeleteFileReader::buildEqualityColumnIndices(
