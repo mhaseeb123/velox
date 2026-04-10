@@ -63,6 +63,7 @@ void scatterDeletesToRowMask(
     cudf::device_span<cudf::size_type const> indices,
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref temp_mr) {
+  // Alternate: Use `cudf::scatter` but it produces a new column.
   auto iter = cuda::constant_iterator<bool>(false);
   thrust::scatter(
       rmm::exec_policy_nosync(stream, temp_mr),
