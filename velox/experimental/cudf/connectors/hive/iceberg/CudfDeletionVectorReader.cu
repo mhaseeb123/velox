@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-#include "velox/experimental/cudf/CudfNoDefaults.h"
 #include "velox/experimental/cudf/connectors/hive/iceberg/CudfDeletionVectorReader.h"
 
 #include <cudf/column/column.hpp>
@@ -56,15 +55,15 @@ struct CudfDeletionVectorReader::RoaringBitmapImpl {
   std::unique_ptr<Roaring64BitmapType> bitmap64;
 
   template <class InputIt, class OutputIt>
-  void contains(
+  void contains_async(
       InputIt first,
       InputIt last,
       OutputIt out,
       rmm::cuda_stream_view stream) {
     if (bitmap64) {
-      bitmap64->contains(first, last, out, stream);
+      bitmap64->contains_async(first, last, out, stream);
     } else if (bitmap32) {
-      bitmap32->contains(first, last, out, stream);
+      bitmap32->contains_async(first, last, out, stream);
     }
   }
 
