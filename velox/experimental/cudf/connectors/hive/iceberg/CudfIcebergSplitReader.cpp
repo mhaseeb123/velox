@@ -27,6 +27,7 @@
 #include "velox/connectors/hive/iceberg/IcebergMetadataColumns.h"
 #include "velox/dwio/common/BufferUtil.h"
 
+#include <cudf/io/parquet.hpp>
 #include <cudf/null_mask.hpp>
 #include <cudf/stream_compaction.hpp>
 #include <cudf/unary.hpp>
@@ -225,69 +226,8 @@ CudfIcebergSplitReader::readNextChunk(
     cudfTable = applyEqualityDeletes(cudfTable->view(), output_mr);
   }
 
-  // Inject partition columns and detect schema-evolution missing columns.
-  // Schema evolution is detected here (post-read) because the parquet reader
-  // silently skips columns not present in the file.
-  {
-    const auto expectedDataColumns =
-        outputType_->size() + extraEqualityColumns_.size() -
-        injectedColumns_.size();
-    if (cudfTable->num_columns() < static_cast<cudf::size_type>(expectedDataColumns)) {
-      // Some data columns are missing from this file (schema evolution).
-      // Build a set of columns actually read by cudf.
-      std::unordered_set<std::string> readCols(
-          readColumnNames_.begin(), readColumnNames_.end());
-      for (size_t i = 0; i < outputType_->size(); ++i) {
-        const auto& name = outputType_->nameOf(i);
-        // Skip columns already marked for injection (partitions)
-        bool alreadyInjected = false;
-        for (const auto& inj : injectedColumns_) {
-          if (inj.outputIndex == i) {
-            alreadyInjected = true;
-            break;
-          }
-        }
-        if (alreadyInjected) {
-          continue;
-        }
-        // If the column is in readColumnNames_ but the parquet reader didn't
-        // return it, it's a schema-evolution missing column
-        if (readCols.count(name) > 0) {
-          // Check if this column was actually returned by cudf by checking
-          // if removing it would explain the column count deficit
-          // Simple approach: just check column count and inject NULLs for
-          // trailing missing columns
-        }
-      }
-      // Simpler approach: the cudf reader returns columns in readColumnNames_
-      // order, skipping those not in the file. Detect which are missing by
-      // comparing expected vs actual count and inject NULLs for them.
-      // We need to know which specific columns are missing. Use the parquet
-      // metadata if available, or just inject NULLs for the trailing columns.
-      size_t deficit = expectedDataColumns - cudfTable->num_columns();
-      // The missing columns are at the END of readColumnNames_ since cudf
-      // preserves order and skips missing ones. Identify them:
-      // Actually, cudf may return columns in any order if some are missing.
-      // The safest approach: inject NULLs for columns not in the file.
-      // For now, inject for columns at the end of outputType_ that are missing.
-      for (size_t i = outputType_->size() - deficit; i < outputType_->size();
-           ++i) {
-        const auto& name = outputType_->nameOf(i);
-        bool alreadyInjected = false;
-        for (const auto& inj : injectedColumns_) {
-          if (inj.outputIndex == i) {
-            alreadyInjected = true;
-            break;
-          }
-        }
-        if (not alreadyInjected) {
-          injectedColumns_.push_back(
-              {i, name, std::nullopt, outputType_->childAt(i)});
-        }
-      }
-    }
-  }
-
+  // Inject partition columns and schema-evolution NULL columns.
+  // Missing columns were detected during setupSchemaReconciliation().
   if (not injectedColumns_.empty() and cudfTable->num_rows() > 0) {
     cudfTable = injectMissingColumns(std::move(cudfTable), output_mr);
   }
@@ -555,18 +495,11 @@ void CudfIcebergSplitReader::setupColumnProjection() {
 }
 
 void CudfIcebergSplitReader::setupSchemaReconciliation() {
-  // Identify partition columns that are in readColumnNames_ but not in the
-  // parquet file. These must be removed from readColumnNames_ (so the parquet
-  // reader doesn't try to read them) and injected after reading.
-  //
-  // Schema evolution (missing data columns) is detected post-read in
-  // injectMissingColumns() since the parquet reader silently skips columns
-  // not present in the file.
+  // Identify partition columns and schema-evolution missing columns.
+  // Partition columns come from the split metadata; missing columns are
+  // detected by reading the parquet file's schema (footer only).
 
-  if (icebergSplit_->partitionKeys.empty()) {
-    return;
-  }
-
+  // 1. Detect partition columns
   for (size_t i = 0; i < outputType_->size(); ++i) {
     const auto& name = outputType_->nameOf(i);
     auto partIt = icebergSplit_->partitionKeys.find(name);
@@ -576,7 +509,40 @@ void CudfIcebergSplitReader::setupSchemaReconciliation() {
     }
   }
 
-  // Remove partition columns from readColumnNames_
+  // 2. Detect schema-evolution missing columns by reading the parquet
+  //    file's schema. Read 0 rows to get just the column names from the
+  //    footer without reading any data.
+  {
+    std::unordered_set<std::string> injectedNames;
+    for (const auto& col : injectedColumns_) {
+      injectedNames.insert(col.name);
+    }
+
+    auto opts = cudf::io::parquet_reader_options::builder(
+                    cudf::io::source_info{split_->filePath})
+                    .num_rows(0)
+                    .build();
+    auto meta = cudf::io::read_parquet(opts, stream_, get_temp_mr());
+    std::unordered_set<std::string> fileColumns;
+    for (const auto& si : meta.metadata.schema_info) {
+      fileColumns.insert(si.name);
+    }
+
+    for (size_t i = 0; i < outputType_->size(); ++i) {
+      const auto& name = outputType_->nameOf(i);
+      if (injectedNames.count(name) > 0) {
+        continue; // Already handled as partition column
+      }
+      if (fileColumns.count(name) == 0) {
+        // Column not in parquet file — schema evolution: inject NULL
+        injectedColumns_.push_back(
+            {i, name, std::nullopt, outputType_->childAt(i)});
+        injectedNames.insert(name);
+      }
+    }
+  }
+
+  // 3. Remove all injected columns from readColumnNames_
   if (not injectedColumns_.empty()) {
     std::unordered_set<std::string> injectedNames;
     for (const auto& col : injectedColumns_) {

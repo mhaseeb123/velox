@@ -487,6 +487,56 @@ TEST_F(CudfDeletionVectorReaderTest, startRowOffset) {
   }
 }
 
+TEST_F(CudfDeletionVectorReaderTest, largeDeletionVector) {
+  // Create a bitmap with positions spanning multiple 16-bit containers to
+  // exercise multi-container roaring bitmap paths. Each container must have
+  // <= 4096 entries (array container limit for the test serializer).
+  // Use 5 containers (high keys 0-4) with ~1024 positions each.
+  std::vector<int64_t> positions;
+  for (int key = 0; key < 5; ++key) {
+    int64_t base = static_cast<int64_t>(key) * 65536;
+    for (int i = 0; i < 1024; ++i) {
+      positions.push_back(base + i * 64); // every 64th value
+    }
+  }
+
+  auto bitmapData = serializeRoaringBitmapNoRun(positions);
+  auto tempFile = writeDvFile(bitmapData);
+  auto fileSize = static_cast<uint64_t>(bitmapData.size());
+
+  auto dvDeleteFile = makeDvDeleteFile(tempFile->getPath(), fileSize);
+  CudfDeletionVectorReader reader(dvDeleteFile);
+
+  // Apply to a 2000-row table starting at row 0. Only positions in
+  // container 0 (key=0, positions 0,64,128,...,65472) overlap with [0,2000).
+  const int64_t numRows = 2000;
+  auto table = makeIndexTable(numRows, stream_, mr_);
+  auto rowMask = std::make_shared<rmm::device_buffer>(
+      numRows * sizeof(bool), stream_, mr_);
+  auto filtered =
+      reader.applyDeletionVector(table->view(), 0, rowMask, stream_, mr_);
+  stream_.synchronize();
+
+  // Count expected deletions in [0, 2000): positions 0,64,128,...,1984
+  int64_t expectedDeleted = 0;
+  std::set<int64_t> deletedInRange;
+  for (auto pos : positions) {
+    if (pos < numRows) {
+      ++expectedDeleted;
+      deletedInRange.insert(pos);
+    }
+  }
+  // 0, 64, 128, ..., 1984 → ceil(2000/64) = 32 deleted
+  EXPECT_EQ(expectedDeleted, 32);
+  EXPECT_EQ(filtered->num_rows(), numRows - expectedDeleted);
+
+  auto survivors = getSurvivorIndices(*filtered);
+  for (auto v : survivors) {
+    EXPECT_EQ(deletedInRange.count(v), 0)
+        << "Row " << v << " should have been deleted";
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Upstream tests NOT ported (with rationale):
 //

@@ -24,15 +24,110 @@
 #include "velox/experimental/cudf/connectors/hive/iceberg/tests/CudfIcebergTestBase.h"
 
 #include "velox/common/file/FileSystems.h"
+#include "velox/common/testutil/TempFilePath.h"
 #include "velox/connectors/hive/iceberg/IcebergDeleteFile.h"
 #include "velox/connectors/hive/iceberg/IcebergMetadataColumns.h"
+#include "velox/experimental/cudf/connectors/hive/iceberg/CudfDeletionVectorReader.h"
 #include "velox/exec/tests/utils/AssertQueryBuilder.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
 
 #include <folly/Singleton.h>
 
+#include <fstream>
+#include <map>
+
 using namespace facebook::velox::exec::test;
 using namespace facebook::velox::connector::hive::iceberg;
+using facebook::velox::common::testutil::TempFilePath;
+using facebook::velox::cudf_velox::connector::hive::iceberg::
+    CudfDeletionVectorReader;
+
+namespace {
+
+/// Serializes a roaring bitmap in the portable format (no-run variant,
+/// cookie = 12346). Supports only array containers (cardinality <= 4096).
+std::string serializeDvBitmap(const std::vector<int64_t>& positions) {
+  if (positions.empty()) {
+    std::string data(8, '\0');
+    uint32_t cookie = 12346;
+    uint32_t numContainers = 0;
+    std::memcpy(data.data(), &cookie, 4);
+    std::memcpy(data.data() + 4, &numContainers, 4);
+    return data;
+  }
+
+  std::map<uint16_t, std::vector<uint16_t>> containers;
+  for (auto pos : positions) {
+    auto key = static_cast<uint16_t>(pos >> 16);
+    auto low = static_cast<uint16_t>(pos & 0xFFFF);
+    containers[key].push_back(low);
+  }
+  for (auto& [key, vals] : containers) {
+    std::sort(vals.begin(), vals.end());
+  }
+
+  uint32_t numContainers = static_cast<uint32_t>(containers.size());
+  std::string data;
+  uint32_t cookie = 12346;
+  data.append(reinterpret_cast<const char*>(&cookie), 4);
+  data.append(reinterpret_cast<const char*>(&numContainers), 4);
+
+  for (auto& [key, vals] : containers) {
+    uint16_t cardMinus1 = static_cast<uint16_t>(vals.size() - 1);
+    data.append(reinterpret_cast<const char*>(&key), 2);
+    data.append(reinterpret_cast<const char*>(&cardMinus1), 2);
+  }
+
+  if (numContainers >= 4) {
+    uint32_t offset = 4 + 4 + numContainers * 4 + numContainers * 4;
+    for (auto& [key, vals] : containers) {
+      data.append(reinterpret_cast<const char*>(&offset), 4);
+      offset += static_cast<uint32_t>(vals.size()) * 2;
+    }
+  }
+
+  for (auto& [key, vals] : containers) {
+    for (auto v : vals) {
+      data.append(reinterpret_cast<const char*>(&v), 2);
+    }
+  }
+
+  return data;
+}
+
+/// Writes a raw roaring bitmap to a temp file and returns the path.
+std::shared_ptr<TempFilePath> writeDvToFile(const std::string& bitmapData) {
+  auto tempFile = TempFilePath::create();
+  std::ofstream out(tempFile->getPath(), std::ios::binary | std::ios::trunc);
+  out.write(bitmapData.data(), static_cast<std::streamsize>(bitmapData.size()));
+  out.close();
+  return tempFile;
+}
+
+/// Creates an IcebergDeleteFile for a deletion vector.
+IcebergDeleteFile makeDvDeleteFile(
+    const std::string& filePath,
+    uint64_t fileSize,
+    int64_t recordCount,
+    int64_t dataSequenceNumber = 0) {
+  std::unordered_map<int32_t, std::string> lowerBounds;
+  std::unordered_map<int32_t, std::string> upperBounds;
+  lowerBounds[CudfDeletionVectorReader::kDvOffsetFieldId] = "0";
+  upperBounds[CudfDeletionVectorReader::kDvLengthFieldId] =
+      std::to_string(fileSize);
+  return IcebergDeleteFile(
+      FileContent::kDeletionVector,
+      filePath,
+      facebook::velox::dwio::common::FileFormat::UNKNOWN,
+      recordCount,
+      fileSize,
+      {},
+      std::move(lowerBounds),
+      std::move(upperBounds),
+      dataSequenceNumber);
+}
+
+} // namespace
 
 namespace facebook::velox::cudf_velox::exec::test {
 
@@ -1182,6 +1277,446 @@ TEST_F(CudfIcebergGapTests, schemaEvolutionWithEqualityDelete) {
       makeFlatVector<int64_t>({1, 3, 4}),
       makeFlatVector<int64_t>({10, 30, 400}),
       makeNullableFlatVector<int64_t>({std::nullopt, std::nullopt, 4000}),
+  });
+
+  assertEqualResults({expected}, {result});
+}
+
+/// =========================================================================
+/// Spec edge-case tests — high and medium priority gaps
+/// =========================================================================
+
+/// NULL equality matching: per Iceberg spec, NULL == NULL is TRUE for
+/// equality deletes (unlike standard SQL). Verifies that rows with NULL
+/// values are correctly deleted when the delete file also contains NULL.
+TEST_F(CudfIcebergGapTests, equalityDeleteNullMatchesNull) {
+  folly::SingletonVault::singleton()->registrationComplete();
+
+  auto rowType = ROW({"c0", "c1"}, {BIGINT(), BIGINT()});
+
+  // Data with NULLs in c0
+  auto baseData = makeRowVector({
+      makeNullableFlatVector<int64_t>({1, std::nullopt, 3, std::nullopt, 5}),
+      makeFlatVector<int64_t>({10, 20, 30, 40, 50}),
+  });
+  auto dataFile = TempFilePath::create();
+  writeToFile(dataFile->getPath(), baseData);
+
+  // Equality delete: c0 = NULL (should match rows where c0 IS NULL)
+  auto eqDel = makeRowVector({
+      makeNullableFlatVector<int64_t>({std::nullopt}),
+  });
+  auto eqDelFile = TempFilePath::create();
+  writeDeleteFile(DeleteFileFormat::PARQUET, eqDelFile->getPath(), {eqDel});
+
+  IcebergDeleteFile eqDelete(
+      FileContent::kEqualityDeletes,
+      eqDelFile->getPath(),
+      dwio::common::FileFormat::PARQUET,
+      1,
+      getFileSize(eqDelFile->getPath()),
+      /*equalityFieldIds=*/{1});
+
+  auto splits = makeIcebergSplits(dataFile->getPath(), {eqDelete});
+  auto plan = makeTableScanPlan(rowType);
+  auto result = AssertQueryBuilder(plan).splits(splits).copyResults(pool());
+
+  // Both NULL rows (c1=20, c1=40) should be deleted
+  auto expected = makeRowVector({
+      makeFlatVector<int64_t>({1, 3, 5}),
+      makeFlatVector<int64_t>({10, 30, 50}),
+  });
+
+  assertEqualResults({expected}, {result});
+}
+
+/// Multiple equality delete files with DIFFERENT key columns targeting
+/// the same data file. Each delete file is applied independently per spec.
+/// A row is deleted if it matches ANY of the applicable delete files.
+TEST_F(CudfIcebergGapTests, multipleEqualityDeletesDifferentKeyColumns) {
+  folly::SingletonVault::singleton()->registrationComplete();
+
+  auto rowType = ROW({"c0", "c1", "c2"}, {BIGINT(), BIGINT(), BIGINT()});
+
+  auto baseData = makeRowVector({
+      makeFlatVector<int64_t>({1, 2, 3, 4, 5}),
+      makeFlatVector<int64_t>({10, 20, 30, 40, 50}),
+      makeFlatVector<int64_t>({100, 200, 300, 400, 500}),
+  });
+  auto dataFile = TempFilePath::create();
+  writeToFile(dataFile->getPath(), baseData);
+
+  // Delete file 1: delete where c0=2 (equalityFieldIds={1})
+  auto eqDel1 = makeRowVector({makeFlatVector<int64_t>({2})});
+  auto eqDelFile1 = TempFilePath::create();
+  writeDeleteFile(DeleteFileFormat::PARQUET, eqDelFile1->getPath(), {eqDel1});
+
+  IcebergDeleteFile eqDelete1(
+      FileContent::kEqualityDeletes,
+      eqDelFile1->getPath(),
+      dwio::common::FileFormat::PARQUET,
+      1,
+      getFileSize(eqDelFile1->getPath()),
+      /*equalityFieldIds=*/{1});
+
+  // Delete file 2: delete where c1=40 (equalityFieldIds={2})
+  // Column name must match the table schema column name for cudf read.
+  auto eqDel2 = makeRowVector({"c1"}, {makeFlatVector<int64_t>({40})});
+  auto eqDelFile2 = TempFilePath::create();
+  writeDeleteFile(DeleteFileFormat::PARQUET, eqDelFile2->getPath(), {eqDel2});
+
+  IcebergDeleteFile eqDelete2(
+      FileContent::kEqualityDeletes,
+      eqDelFile2->getPath(),
+      dwio::common::FileFormat::PARQUET,
+      1,
+      getFileSize(eqDelFile2->getPath()),
+      /*equalityFieldIds=*/{2});
+
+  auto splits =
+      makeIcebergSplits(dataFile->getPath(), {eqDelete1, eqDelete2});
+  auto plan = makeTableScanPlan(rowType);
+  auto result = AssertQueryBuilder(plan).splits(splits).copyResults(pool());
+
+  // c0=2 (row 2) deleted by file 1, c1=40 (row 4) deleted by file 2
+  // Surviving: rows 1, 3, 5
+  auto expected = makeRowVector({
+      makeFlatVector<int64_t>({1, 3, 5}),
+      makeFlatVector<int64_t>({10, 30, 50}),
+      makeFlatVector<int64_t>({100, 300, 500}),
+  });
+
+  assertEqualResults({expected}, {result});
+}
+
+/// All rows deleted by equality deletes — verify that reading continues
+/// past an empty chunk (DuckDB issue #624: empty chunk treated as EOS).
+TEST_F(CudfIcebergGapTests, allRowsDeletedContinuesReading) {
+  folly::SingletonVault::singleton()->registrationComplete();
+
+  auto rowType = ROW({"c0"}, {BIGINT()});
+
+  // File 1: all values will be deleted
+  auto data1 = makeRowVector({makeFlatVector<int64_t>({1, 2, 3})});
+  auto dataFile1 = TempFilePath::create();
+  writeToFile(dataFile1->getPath(), data1);
+
+  // File 2: some values survive
+  auto data2 = makeRowVector({makeFlatVector<int64_t>({4, 5, 6})});
+  auto dataFile2 = TempFilePath::create();
+  writeToFile(dataFile2->getPath(), data2);
+
+  // Delete c0 = {1, 2, 3, 4} — kills all of file 1 and one row of file 2
+  auto eqDel =
+      makeRowVector({makeFlatVector<int64_t>({1, 2, 3, 4})});
+  auto eqDelFile = TempFilePath::create();
+  writeDeleteFile(DeleteFileFormat::PARQUET, eqDelFile->getPath(), {eqDel});
+
+  IcebergDeleteFile eqDelete(
+      FileContent::kEqualityDeletes,
+      eqDelFile->getPath(),
+      dwio::common::FileFormat::PARQUET,
+      1,
+      getFileSize(eqDelFile->getPath()),
+      /*equalityFieldIds=*/{1});
+
+  auto splits1 = makeIcebergSplits(dataFile1->getPath(), {eqDelete});
+  auto splits2 = makeIcebergSplits(dataFile2->getPath(), {eqDelete});
+  std::vector<std::shared_ptr<facebook::velox::connector::ConnectorSplit>> all;
+  all.insert(all.end(), splits1.begin(), splits1.end());
+  all.insert(all.end(), splits2.begin(), splits2.end());
+
+  auto plan = makeTableScanPlan(rowType);
+  auto result = AssertQueryBuilder(plan).splits(all).copyResults(pool());
+
+  // File 1: 0 rows survive. File 2: c0=5,6 survive.
+  auto expected = makeRowVector({
+      makeFlatVector<int64_t>({5, 6}),
+  });
+
+  assertEqualResults({expected}, {result});
+}
+
+/// Equality delete file with extra non-key columns (for CDC).
+/// Only equalityFieldIds columns should be used for matching.
+TEST_F(CudfIcebergGapTests, equalityDeleteWithExtraNonKeyColumns) {
+  folly::SingletonVault::singleton()->registrationComplete();
+
+  auto rowType = ROW({"c0", "c1"}, {BIGINT(), BIGINT()});
+
+  auto baseData = makeRowVector({
+      makeFlatVector<int64_t>({1, 2, 3, 4, 5}),
+      makeFlatVector<int64_t>({10, 20, 30, 40, 50}),
+  });
+  auto dataFile = TempFilePath::create();
+  writeToFile(dataFile->getPath(), baseData);
+
+  // Delete file has c0 AND c1, but only c0 is in equalityFieldIds.
+  // The c1 column is extra metadata (for CDC reconstruction).
+  // Only c0 should be used for matching.
+  auto eqDel = makeRowVector({
+      makeFlatVector<int64_t>({2, 4}),
+      makeFlatVector<int64_t>({999, 888}), // extra column, not used
+  });
+  auto eqDelFile = TempFilePath::create();
+  writeDeleteFile(DeleteFileFormat::PARQUET, eqDelFile->getPath(), {eqDel});
+
+  IcebergDeleteFile eqDelete(
+      FileContent::kEqualityDeletes,
+      eqDelFile->getPath(),
+      dwio::common::FileFormat::PARQUET,
+      2,
+      getFileSize(eqDelFile->getPath()),
+      /*equalityFieldIds=*/{1}); // Only c0 is the key
+
+  auto splits = makeIcebergSplits(dataFile->getPath(), {eqDelete});
+  auto plan = makeTableScanPlan(rowType);
+  auto result = AssertQueryBuilder(plan).splits(splits).copyResults(pool());
+
+  // c0=2 and c0=4 deleted regardless of extra c1 values in delete file
+  auto expected = makeRowVector({
+      makeFlatVector<int64_t>({1, 3, 5}),
+      makeFlatVector<int64_t>({10, 30, 50}),
+  });
+
+  assertEqualResults({expected}, {result});
+}
+
+/// Schema evolution: column added in the MIDDLE of the schema, not at the
+/// end. File 1 has [c0, c2], file 2 has [c0, c1, c2]. Tests that the
+/// schema reconciliation handles non-trailing missing columns.
+TEST_F(CudfIcebergGapTests, schemaEvolutionColumnAddedInMiddle) {
+  folly::SingletonVault::singleton()->registrationComplete();
+
+  auto fullType = ROW({"c0", "c1", "c2"}, {BIGINT(), BIGINT(), BIGINT()});
+  // File 1 was written before c1 was added — it only has c0, c2.
+  // Use writeDeleteFile(PARQUET) to preserve the actual column names
+  // (writeToFile renames columns to c0,c1,... by index).
+  auto data1 = makeRowVector(
+      {"c0", "c2"},
+      {
+          makeFlatVector<int64_t>({1, 2}),
+          makeFlatVector<int64_t>({100, 200}),
+      });
+  auto dataFile1 = TempFilePath::create();
+  writeDeleteFile(DeleteFileFormat::PARQUET, dataFile1->getPath(), {data1});
+
+  // File 2: full schema
+  auto data2 = makeRowVector(
+      {"c0", "c1", "c2"},
+      {
+          makeFlatVector<int64_t>({3, 4}),
+          makeFlatVector<int64_t>({30, 40}),
+          makeFlatVector<int64_t>({300, 400}),
+      });
+  auto dataFile2 = TempFilePath::create();
+  writeDeleteFile(DeleteFileFormat::PARQUET, dataFile2->getPath(), {data2});
+
+  auto splits1 = makeIcebergSplits(dataFile1->getPath());
+  auto splits2 = makeIcebergSplits(dataFile2->getPath());
+
+  std::vector<std::shared_ptr<facebook::velox::connector::ConnectorSplit>> all;
+  all.insert(all.end(), splits1.begin(), splits1.end());
+  all.insert(all.end(), splits2.begin(), splits2.end());
+
+  auto plan = PlanBuilder()
+                  .startTableScan()
+                  .connectorId(kCudfIcebergConnectorId)
+                  .outputType(fullType)
+                  .dataColumns(fullType)
+                  .endTableScan()
+                  .planNode();
+
+  auto result = AssertQueryBuilder(plan).splits(all).copyResults(pool());
+
+  // File 1: c1 should be NULL since the column doesn't exist in file
+  // File 2: all columns present
+  auto expected = makeRowVector({
+      makeFlatVector<int64_t>({1, 2, 3, 4}),
+      makeNullableFlatVector<int64_t>({std::nullopt, std::nullopt, 30, 40}),
+      makeFlatVector<int64_t>({100, 200, 300, 400}),
+  });
+
+  assertEqualResults({expected}, {result});
+}
+
+/// Empty data file (0 rows) with delete files attached. Should not error.
+TEST_F(CudfIcebergGapTests, emptyDataFileWithDeletes) {
+  folly::SingletonVault::singleton()->registrationComplete();
+
+  auto rowType = ROW({"c0", "c1"}, {BIGINT(), BIGINT()});
+
+  // Empty data file
+  auto emptyData = makeRowVector({
+      makeFlatVector<int64_t>({}),
+      makeFlatVector<int64_t>({}),
+  });
+  auto dataFile = TempFilePath::create();
+  writeToFile(dataFile->getPath(), emptyData);
+
+  // Non-empty data file
+  auto realData = makeRowVector({
+      makeFlatVector<int64_t>({1, 2, 3}),
+      makeFlatVector<int64_t>({10, 20, 30}),
+  });
+  auto dataFile2 = TempFilePath::create();
+  writeToFile(dataFile2->getPath(), realData);
+
+  // Equality delete on c0=2
+  auto eqDel = makeRowVector({makeFlatVector<int64_t>({2})});
+  auto eqDelFile = TempFilePath::create();
+  writeDeleteFile(DeleteFileFormat::PARQUET, eqDelFile->getPath(), {eqDel});
+
+  IcebergDeleteFile eqDelete(
+      FileContent::kEqualityDeletes,
+      eqDelFile->getPath(),
+      dwio::common::FileFormat::PARQUET,
+      1,
+      getFileSize(eqDelFile->getPath()),
+      /*equalityFieldIds=*/{1});
+
+  // Attach delete file to both the empty and non-empty data files
+  auto splits1 = makeIcebergSplits(dataFile->getPath(), {eqDelete});
+  auto splits2 = makeIcebergSplits(dataFile2->getPath(), {eqDelete});
+  std::vector<std::shared_ptr<facebook::velox::connector::ConnectorSplit>> all;
+  all.insert(all.end(), splits1.begin(), splits1.end());
+  all.insert(all.end(), splits2.begin(), splits2.end());
+
+  auto plan = makeTableScanPlan(rowType);
+  auto result = AssertQueryBuilder(plan).splits(all).copyResults(pool());
+
+  // Empty file contributes nothing, real file loses c0=2
+  auto expected = makeRowVector({
+      makeFlatVector<int64_t>({1, 3}),
+      makeFlatVector<int64_t>({10, 30}),
+  });
+
+  assertEqualResults({expected}, {result});
+}
+
+/// Partition column with INT32 type (not just string).
+/// Tests that injectMissingColumns handles typed partition values.
+TEST_F(CudfIcebergGapTests, partitionColumnInt32Type) {
+  folly::SingletonVault::singleton()->registrationComplete();
+
+  auto fullType = ROW({"c0", "year"}, {BIGINT(), INTEGER()});
+  auto dataColumns = ROW({"c0"}, {BIGINT()});
+
+  auto baseData = makeRowVector({
+      makeFlatVector<int64_t>({1, 2, 3}),
+  });
+  auto dataFile = TempFilePath::create();
+  writeToFile(dataFile->getPath(), baseData);
+
+  std::unordered_map<std::string, std::optional<std::string>> partitionKeys = {
+      {"year", "2025"},
+  };
+
+  auto splits = makeIcebergSplits(dataFile->getPath(), {}, partitionKeys);
+
+  auto plan = PlanBuilder()
+                  .startTableScan()
+                  .connectorId(kCudfIcebergConnectorId)
+                  .outputType(fullType)
+                  .dataColumns(dataColumns)
+                  .endTableScan()
+                  .planNode();
+
+  auto result = AssertQueryBuilder(plan).splits(splits).copyResults(pool());
+
+  auto expected = makeRowVector({
+      makeFlatVector<int64_t>({1, 2, 3}),
+      makeFlatVector<int32_t>({2025, 2025, 2025}),
+  });
+
+  assertEqualResults({expected}, {result});
+}
+
+/// Partition column with INT64 type.
+TEST_F(CudfIcebergGapTests, partitionColumnInt64Type) {
+  folly::SingletonVault::singleton()->registrationComplete();
+
+  auto fullType = ROW({"c0", "timestamp_ms"}, {BIGINT(), BIGINT()});
+  auto dataColumns = ROW({"c0"}, {BIGINT()});
+
+  auto baseData = makeRowVector({
+      makeFlatVector<int64_t>({10, 20, 30}),
+  });
+  auto dataFile = TempFilePath::create();
+  writeToFile(dataFile->getPath(), baseData);
+
+  std::unordered_map<std::string, std::optional<std::string>> partitionKeys = {
+      {"timestamp_ms", "1700000000000"},
+  };
+
+  auto splits = makeIcebergSplits(dataFile->getPath(), {}, partitionKeys);
+
+  auto plan = PlanBuilder()
+                  .startTableScan()
+                  .connectorId(kCudfIcebergConnectorId)
+                  .outputType(fullType)
+                  .dataColumns(dataColumns)
+                  .endTableScan()
+                  .planNode();
+
+  auto result = AssertQueryBuilder(plan).splits(splits).copyResults(pool());
+
+  auto expected = makeRowVector({
+      makeFlatVector<int64_t>({10, 20, 30}),
+      makeFlatVector<int64_t>(
+          {1700000000000LL, 1700000000000LL, 1700000000000LL}),
+  });
+
+  assertEqualResults({expected}, {result});
+}
+
+/// Deletion vector combined with equality deletes on the same data file.
+/// DV removes by position, equality delete removes by value. Both must apply.
+TEST_F(CudfIcebergGapTests, deletionVectorPlusEqualityDelete) {
+  folly::SingletonVault::singleton()->registrationComplete();
+
+  auto rowType = ROW({"c0", "c1"}, {BIGINT(), BIGINT()});
+
+  auto baseData = makeRowVector({
+      makeFlatVector<int64_t>({10, 20, 30, 40, 50, 60, 70, 80}),
+      makeFlatVector<int64_t>({1, 2, 3, 4, 5, 6, 7, 8}),
+  });
+  auto dataFile = TempFilePath::create();
+  writeToFile(dataFile->getPath(), baseData);
+
+  // DV: delete positions 0 and 7 (c0=10, c0=80)
+  auto bitmapData = serializeDvBitmap({0, 7});
+  auto dvFile = writeDvToFile(bitmapData);
+  auto dvDelete = makeDvDeleteFile(
+      dvFile->getPath(), bitmapData.size(), 2, /*dataSequenceNumber=*/2);
+
+  // Equality delete: delete c0=30, c0=60
+  auto eqDel = makeRowVector({makeFlatVector<int64_t>({30, 60})});
+  auto eqDelFile = TempFilePath::create();
+  writeDeleteFile(DeleteFileFormat::PARQUET, eqDelFile->getPath(), {eqDel});
+
+  IcebergDeleteFile eqDelete(
+      FileContent::kEqualityDeletes,
+      eqDelFile->getPath(),
+      dwio::common::FileFormat::PARQUET,
+      2,
+      getFileSize(eqDelFile->getPath()),
+      /*equalityFieldIds=*/{1},
+      /*lowerBounds=*/{},
+      /*upperBounds=*/{},
+      /*dataSequenceNumber=*/3);
+
+  auto splits = makeIcebergSplits(
+      dataFile->getPath(), {dvDelete, eqDelete}, {}, 1, /*dataSeq=*/1);
+
+  auto plan = makeTableScanPlan(rowType);
+  auto result = AssertQueryBuilder(plan).splits(splits).copyResults(pool());
+
+  // DV removes pos 0,7 (c0=10,80). Equality removes c0=30,60.
+  // Surviving: (20,2), (40,4), (50,5), (70,7)
+  auto expected = makeRowVector({
+      makeFlatVector<int64_t>({20, 40, 50, 70}),
+      makeFlatVector<int64_t>({2, 4, 5, 7}),
   });
 
   assertEqualResults({expected}, {result});
