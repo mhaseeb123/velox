@@ -256,7 +256,9 @@ CudfIcebergSplitReader::readNextChunk(
 
   // Inject partition columns and schema-evolution NULL columns.
   // Missing columns were detected during setupSchemaReconciliation().
-  if (not injectedColumns_.empty() and cudfTable->num_rows() > 0) {
+  // This must run even for 0-row tables so post-delete empty chunks still
+  // have the expected number and order of output columns.
+  if (not injectedColumns_.empty()) {
     cudfTable = injectMissingColumns(std::move(cudfTable), output_mr);
   }
 
@@ -546,6 +548,10 @@ void CudfIcebergSplitReader::setupSchemaReconciliation() {
       injectedNames.insert(col.name);
     }
 
+    // TODO(ducndh): This bypasses the BufferedInput/token-provider path used
+    // by the main reader when useBufferedInputSession() is enabled. It will
+    // fail on non-local filesystems (S3/HDFS). When adding remote filesystem
+    // support, use the same datasource construction as the main reader.
     auto opts = cudf::io::parquet_reader_options::builder(
                     cudf::io::source_info{split_->filePath})
                     .num_rows(0)
@@ -620,17 +626,36 @@ std::unique_ptr<cudf::table> CudfIcebergSplitReader::injectMissingColumns(
         // Partition column: create constant with the partition value.
         const auto& value = sorted[injIdx].partitionValue.value();
         std::unique_ptr<cudf::scalar> scalar;
-        if (cudfType.id() == cudf::type_id::STRING) {
-          scalar = std::make_unique<cudf::string_scalar>(value, true, stream_, mr);
-        } else if (cudfType.id() == cudf::type_id::INT64) {
-          scalar = std::make_unique<cudf::numeric_scalar<int64_t>>(
-              std::stoll(value), true, stream_, mr);
-        } else if (cudfType.id() == cudf::type_id::INT32) {
-          scalar = std::make_unique<cudf::numeric_scalar<int32_t>>(
-              std::stoi(value), true, stream_, mr);
-        } else {
-          // Fallback: use string scalar for unsupported types.
-          scalar = std::make_unique<cudf::string_scalar>(value, true, stream_, mr);
+        const auto& colName = sorted[injIdx].name;
+        try {
+          if (cudfType.id() == cudf::type_id::STRING) {
+            scalar = std::make_unique<cudf::string_scalar>(
+                value, true, stream_, mr);
+          } else if (cudfType.id() == cudf::type_id::INT64) {
+            scalar = std::make_unique<cudf::numeric_scalar<int64_t>>(
+                std::stoll(value), true, stream_, mr);
+          } else if (cudfType.id() == cudf::type_id::INT32) {
+            scalar = std::make_unique<cudf::numeric_scalar<int32_t>>(
+                std::stoi(value), true, stream_, mr);
+          } else {
+            VELOX_FAIL(
+                "Unsupported partition column type for constant injection: "
+                "column '{}', type {}",
+                colName,
+                sorted[injIdx].veloxType->toString());
+          }
+        } catch (const std::invalid_argument& e) {
+          VELOX_FAIL(
+              "Invalid partition value for column '{}' (type {}): '{}'",
+              colName,
+              sorted[injIdx].veloxType->toString(),
+              value);
+        } catch (const std::out_of_range& e) {
+          VELOX_FAIL(
+              "Partition value out of range for column '{}' (type {}): '{}'",
+              colName,
+              sorted[injIdx].veloxType->toString(),
+              value);
         }
         output.push_back(
             cudf::make_column_from_scalar(*scalar, numRows, stream_, mr));
