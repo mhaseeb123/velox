@@ -78,6 +78,15 @@ class CudfDeletionVectorReader {
       rmm::cuda_stream_view stream,
       rmm::device_async_resource_ref mr);
 
+  /// Marks deleted positions in the shared row mask WITHOUT filtering the
+  /// table. For each row in [startRow, startRow+numRows), sets rowMask[i]
+  /// to false if that absolute position is in the deletion vector.
+  void markDeletionVector(
+      std::shared_ptr<rmm::device_buffer> rowMask,
+      std::size_t startRow,
+      cudf::size_type numRows,
+      rmm::cuda_stream_view stream);
+
   /// Field IDs used to encode DV blob offset and length in the
   /// IcebergDeleteFile bounds maps. The coordinator encodes these when
   /// building splits from Puffin file metadata.

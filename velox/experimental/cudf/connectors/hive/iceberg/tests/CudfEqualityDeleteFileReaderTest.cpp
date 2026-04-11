@@ -1722,4 +1722,66 @@ TEST_F(CudfIcebergGapTests, deletionVectorPlusEqualityDelete) {
   assertEqualResults({expected}, {result});
 }
 
+/// Deletion vector combined with positional deletes (V2 + V3 coexistence).
+/// Both should apply — DV removes some positions, positional delete removes
+/// others. Requires the unified row mask pipeline.
+TEST_F(CudfIcebergGapTests, deletionVectorPlusPositionalDelete) {
+  folly::SingletonVault::singleton()->registrationComplete();
+
+  auto rowType = ROW({"c0", "c1"}, {BIGINT(), BIGINT()});
+
+  auto baseData = makeRowVector({
+      makeFlatVector<int64_t>({10, 20, 30, 40, 50, 60}),
+      makeFlatVector<int64_t>({1, 2, 3, 4, 5, 6}),
+  });
+  auto dataFile = TempFilePath::create();
+  writeToFile(dataFile->getPath(), baseData);
+
+  // DV: delete positions 0 and 5 (c0=10, c0=60)
+  auto bitmapData = serializeDvBitmap({0, 5});
+  auto dvFile = writeDvToFile(bitmapData);
+  auto dvDelete = makeDvDeleteFile(
+      dvFile->getPath(), bitmapData.size(), 2, /*dataSequenceNumber=*/2);
+
+  // Positional delete: delete position 2 (c0=30)
+  auto pathColumn = IcebergMetadataColumn::icebergDeleteFilePathColumn();
+  auto posColumn = IcebergMetadataColumn::icebergDeletePosColumn();
+  auto posDeleteFile = TempFilePath::create();
+  auto filePathVec = makeFlatVector<std::string>(
+      1, [&](vector_size_t) { return dataFile->getPath(); });
+  auto posVec = makeFlatVector<int64_t>({2});
+  auto posDeleteVector =
+      makeRowVector({pathColumn->name, posColumn->name}, {filePathVec, posVec});
+  writeDeleteFile(
+      DeleteFileFormat::DWRF,
+      posDeleteFile->getPath(),
+      std::vector<RowVectorPtr>{posDeleteVector});
+
+  IcebergDeleteFile posDelete(
+      FileContent::kPositionalDeletes,
+      posDeleteFile->getPath(),
+      dwio::common::FileFormat::DWRF,
+      1,
+      getFileSize(posDeleteFile->getPath()),
+      /*equalityFieldIds=*/{},
+      /*lowerBounds=*/{},
+      /*upperBounds=*/{},
+      /*dataSequenceNumber=*/2);
+
+  auto splits = makeIcebergSplits(
+      dataFile->getPath(), {dvDelete, posDelete}, {}, 1, /*dataSeq=*/1);
+
+  auto plan = makeTableScanPlan(rowType);
+  auto result = AssertQueryBuilder(plan).splits(splits).copyResults(pool());
+
+  // DV removes pos 0,5 (c0=10,60). Positional removes pos 2 (c0=30).
+  // Surviving: (20,2), (40,4), (50,5)
+  auto expected = makeRowVector({
+      makeFlatVector<int64_t>({20, 40, 50}),
+      makeFlatVector<int64_t>({2, 4, 5}),
+  });
+
+  assertEqualResults({expected}, {result});
+}
+
 } // namespace facebook::velox::cudf_velox::exec::test

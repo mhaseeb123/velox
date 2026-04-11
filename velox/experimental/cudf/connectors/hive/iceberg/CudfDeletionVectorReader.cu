@@ -114,6 +114,54 @@ template void CudfDeletionVectorReader::buildBitmap<
     std::string_view,
     rmm::cuda_stream_view);
 
+void CudfDeletionVectorReader::markDeletionVector(
+    std::shared_ptr<rmm::device_buffer> rowMask,
+    std::size_t startRow,
+    cudf::size_type numRows,
+    rmm::cuda_stream_view stream) {
+  if (numRows == 0) {
+    return;
+  }
+
+  // Load the cuco roaring bitmap (lazy, idempotent)
+  loadBitmap(stream);
+
+  // Nothing to mark if no bitmap or empty bitmap
+  if (not bitmap_ or bitmap_->empty()) {
+    return;
+  }
+
+  auto mr = rmm::mr::get_current_device_resource_ref();
+
+  auto probeDeletionVector = [&](auto& bitmap) {
+    using ValueType =
+        typename std::remove_reference_t<decltype(bitmap)>::value_type;
+
+    if (!rowIndices_ || rowIndices_->size() < numRows * sizeof(ValueType)) {
+      rowIndices_ = std::make_unique<rmm::device_buffer>(
+          numRows * sizeof(ValueType), stream, mr);
+    }
+
+    auto rowIndexIter = static_cast<ValueType*>(rowIndices_->data());
+    thrust::sequence(
+        rmm::exec_policy_nosync(stream),
+        rowIndexIter,
+        rowIndexIter + numRows,
+        static_cast<ValueType>(startRow));
+
+    auto rowMaskIter = cuda::make_transform_output_iterator(
+        static_cast<bool*>(rowMask->data()), NegateBool{});
+    bitmap.contains_async(
+        rowIndexIter, rowIndexIter + numRows, rowMaskIter, stream);
+  };
+
+  if (bitmap_->bitmap32) {
+    probeDeletionVector(*bitmap_->bitmap32);
+  } else {
+    probeDeletionVector(*bitmap_->bitmap64);
+  }
+}
+
 std::unique_ptr<cudf::table> CudfDeletionVectorReader::applyDeletionVector(
     cudf::table_view const& table,
     std::size_t startRow,

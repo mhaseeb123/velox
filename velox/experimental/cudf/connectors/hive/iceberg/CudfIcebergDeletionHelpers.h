@@ -52,4 +52,14 @@ void scatterDeletesToRowMask(
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref temp_mr);
 
+/// Merges a deletion bitmap into an existing row mask. For each row index,
+/// clears the mask bit if the corresponding bitmap bit is set (deleted).
+/// Unlike convertDeletionBitmapToRowMask which overwrites, this preserves
+/// existing false entries in the mask (AND semantics).
+void mergeDeletionBitmapIntoRowMask(
+    cudf::device_span<cudf::bitmask_type const> deviceBitmap,
+    cudf::device_span<bool> rowMask,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref temp_mr);
+
 } // namespace facebook::velox::cudf_velox::connector::hive::iceberg

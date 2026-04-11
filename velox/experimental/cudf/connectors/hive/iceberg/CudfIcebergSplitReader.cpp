@@ -164,66 +164,94 @@ CudfIcebergSplitReader::readNextChunk(
     return std::nullopt;
   }
 
-  // Number of table rows read by cuDF
+  // Number of table rows read by cuDF (before any deletes)
   const auto numRows = cudfTable->num_rows();
 
   // Determine if we will be applying any deletes
   const auto willApplyDeletes = deletionVectorReader_ or
       positionalDeleteFileReaders_.size() or equalityDeleteFileReaders_.size();
-  const auto rowMaskUnallocated = not rowMask_ or rowMask_->size() < numRows;
-  if (willApplyDeletes and rowMaskUnallocated) {
-    rowMask_ =
-        std::make_shared<rmm::device_buffer>(numRows, stream_, get_temp_mr());
-  }
 
-  // Apply deletion vector, if any
-  if (deletionVectorReader_ and cudfTable->num_rows() > 0) {
-    // If we will be applying positional or equality deletes later, use the
-    // temporary mr. Otherwise, use the output mr.
-    mr =
-        positionalDeleteFileReaders_.size() or equalityDeleteFileReaders_.size()
-        ? get_temp_mr()
-        : output_mr;
-    cudfTable = deletionVectorReader_->applyDeletionVector(
-        cudfTable->view(), baseReadOffset_, rowMask_, stream_, mr);
-
-    // Reset the deletion vector reader if we have read the entire bitmap.
-    if (deletionVectorReader_->noMoreData()) {
-      deletionVectorReader_.reset();
+  if (willApplyDeletes and numRows > 0) {
+    // Ensure the shared row mask is large enough
+    if (not rowMask_ or
+        rowMask_->size() < static_cast<std::size_t>(numRows)) {
+      rowMask_ =
+          std::make_shared<rmm::device_buffer>(numRows, stream_, get_temp_mr());
     }
-  }
 
-  // Initialize the delete bitmap if we will be applying positional deletes.
-  // Equality deletes use the GPU-native row mask path directly.
-  if (cudfTable->num_rows() > 0 and not positionalDeleteFileReaders_.empty()) {
-    const auto numWords = cudf::num_bitmask_words(numRows);
-    const auto numBitmaskBytes = numWords * sizeof(cudf::bitmask_type);
-    dwio::common::ensureCapacity<int8_t>(
-        deleteBitmap_,
-        numBitmaskBytes,
-        connectorQueryCtx_->memoryPool(),
-        false,
-        true);
+    // Initialize the row mask to all-true
+    CUDF_CUDA_TRY(cudaMemsetAsync(
+        rowMask_->data(), true, numRows * sizeof(bool), stream_.value()));
 
-    if (not deviceDeleteBitmap_ or
-        deviceDeleteBitmap_->size() < numBitmaskBytes) {
-      deviceDeleteBitmap_ = std::make_shared<rmm::device_buffer>(
-          numBitmaskBytes, stream_, get_temp_mr());
+    // 1. Mark deletion vector positions in the shared mask
+    if (deletionVectorReader_) {
+      deletionVectorReader_->markDeletionVector(
+          rowMask_, baseReadOffset_, numRows, stream_);
+      if (deletionVectorReader_->noMoreData()) {
+        deletionVectorReader_.reset();
+      }
     }
-  }
 
-  // Apply positional deletes, if any
-  if (cudfTable->num_rows() > 0 and not positionalDeleteFileReaders_.empty()) {
-    // If we will be applying equality deletes later, use the temporary mr.
-    // Otherwise, use the output mr.
-    mr = equalityDeleteFileReaders_.size() ? get_temp_mr() : output_mr;
-    cudfTable = applyPositionalDeletes(cudfTable->view(), mr);
-  }
+    // 2. Mark positional delete positions in the shared mask
+    if (not positionalDeleteFileReaders_.empty()) {
+      const auto numWords = cudf::num_bitmask_words(numRows);
+      const auto numBitmaskBytes = numWords * sizeof(cudf::bitmask_type);
+      dwio::common::ensureCapacity<int8_t>(
+          deleteBitmap_,
+          numBitmaskBytes,
+          connectorQueryCtx_->memoryPool(),
+          false,
+          true);
 
-  // Apply equality deletes, if any
-  if (cudfTable->num_rows() > 0 and not equalityDeleteFileReaders_.empty()) {
-    // Use the output mr as there will be no more deletes after this
-    cudfTable = applyEqualityDeletes(cudfTable->view(), output_mr);
+      if (not deviceDeleteBitmap_ or
+          deviceDeleteBitmap_->size() < numBitmaskBytes) {
+        deviceDeleteBitmap_ = std::make_shared<rmm::device_buffer>(
+            numBitmaskBytes, stream_, get_temp_mr());
+      }
+
+      for (auto iter = positionalDeleteFileReaders_.begin();
+           iter != positionalDeleteFileReaders_.end();) {
+        (*iter)->readDeletePositions(baseReadOffset_, numRows, deleteBitmap_);
+        if ((*iter)->noMoreData()) {
+          iter = positionalDeleteFileReaders_.erase(iter);
+        } else {
+          ++iter;
+        }
+      }
+
+      CUDF_CUDA_TRY(cudaMemcpyAsync(
+          deviceDeleteBitmap_->data(),
+          deleteBitmap_->as<uint8_t>(),
+          numBitmaskBytes,
+          cudaMemcpyHostToDevice,
+          stream_.value()));
+
+      mergeDeletionBitmapIntoRowMask(
+          cudf::device_span<cudf::bitmask_type>(
+              static_cast<cudf::bitmask_type*>(deviceDeleteBitmap_->data()),
+              numWords),
+          cudf::device_span<bool>(
+              static_cast<bool*>(rowMask_->data()), numRows),
+          stream_,
+          get_temp_mr());
+    }
+
+    // 3. Mark equality delete matches in the shared mask
+    for (auto& reader : equalityDeleteFileReaders_) {
+      reader->applyDeletes(
+          cudfTable->view(), readColumnNames_, rowMask_, stream_, get_temp_mr());
+    }
+
+    // Apply the combined mask once
+    auto rowMaskCol = cudf::column_view(
+        cudf::data_type{cudf::type_id::BOOL8},
+        numRows,
+        rowMask_->data(),
+        nullptr,
+        0,
+        0);
+    cudfTable =
+        cudf::apply_boolean_mask(cudfTable->view(), rowMaskCol, stream_, output_mr);
   }
 
   // Inject partition columns and schema-evolution NULL columns.

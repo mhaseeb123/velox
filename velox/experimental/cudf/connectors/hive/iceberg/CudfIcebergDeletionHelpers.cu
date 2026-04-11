@@ -73,4 +73,33 @@ void scatterDeletesToRowMask(
       rowMask.begin());
 }
 
+namespace {
+
+/// Clears a row mask bit if the corresponding deletion bitmap bit is set.
+/// Preserves existing false values (AND semantics).
+struct MergeBitmapIntoMask {
+  const cudf::bitmask_type* bitmask;
+  __device__ bool operator()(cudf::size_type index, bool currentMask) const
+      noexcept {
+    return currentMask and not cudf::bit_is_set(bitmask, index);
+  }
+};
+
+} // namespace
+
+void mergeDeletionBitmapIntoRowMask(
+    cudf::device_span<cudf::bitmask_type const> deviceBitmap,
+    cudf::device_span<bool> rowMask,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref temp_mr) {
+  auto iter = cuda::counting_iterator{0};
+  thrust::transform(
+      rmm::exec_policy_nosync(stream, temp_mr),
+      iter,
+      iter + rowMask.size(),
+      rowMask.begin(),
+      rowMask.begin(),
+      MergeBitmapIntoMask{deviceBitmap.data()});
+}
+
 } // namespace facebook::velox::cudf_velox::connector::hive::iceberg
