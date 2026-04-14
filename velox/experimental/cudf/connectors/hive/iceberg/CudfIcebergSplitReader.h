@@ -94,17 +94,42 @@ class CudfIcebergSplitReader : public CudfSplitReader {
   /// that are not already in the output projection.
   void setupColumnProjection();
 
-  /// Detect partition columns and columns missing due to schema evolution.
-  /// Filters partition columns from readColumnNames_ and records which
-  /// output columns need post-read injection (constant partition values
-  /// or typed NULLs for schema evolution).
-  void setupSchemaReconciliation();
+  /// Adapts the data file schema to match the table schema expected by the
+  /// query.
+  ///
+  /// This method reconciles differences between the physical data file schema
+  /// and the logical table schema, handling various scenarios where columns may
+  /// be missing, added, or need special treatment.
+  ///
+  /// Classifies each output column into one of:
+  ///
+  /// 1. Info columns:
+  ///    Column is a synthesized info column (e.g., $file_size) from the
+  ///    split metadata. Recorded for post-read injection as a constant.
+  ///
+  /// 2. Columns present in File:
+  ///    Column exists in the parquet file and will be read normally.
+  ///    Type coercion is handled by the cudf parquet reader options.
+  ///
+  /// 3. Columns missing from File:
+  ///    a) Partition columns (Hive-migrated tables):
+  ///       Column is a partition key in the Iceberg split. In Hive-written
+  ///       Iceberg tables, partition column values are stored in partition
+  ///       metadata, not in the data file itself. Recorded for post-read
+  ///       injection as a constant.
+  ///    b) Schema evolution (newly added columns):
+  ///       Column was added to the table schema after this data file was
+  ///       written. Recorded for post-read injection as a typed NULL column.
+  ///
+  /// Columns are recorded in injectedColumns_ and removed from readColumnNames_
+  /// so they are injected after reading using `injectMissingColumns()`.
+  void adaptColumns();
 
   /// Inject partition columns and schema-evolution NULL columns into the
   /// cudf table after reading. Returns a new table with all output columns
   /// in the correct order.
   std::unique_ptr<cudf::table> injectMissingColumns(
-      std::unique_ptr<cudf::table> table,
+      std::unique_ptr<cudf::table>&& table,
       rmm::device_async_resource_ref mr);
 
   std::shared_ptr<const velox_iceberg::HiveIcebergSplit> icebergSplit_;
@@ -135,7 +160,7 @@ class CudfIcebergSplitReader : public CudfSplitReader {
     TypePtr veloxType;
   };
 
-  /// Columns to inject after reading. Populated by setupSchemaReconciliation().
+  /// Columns to inject after reading. Populated by adaptColumns().
   std::vector<InjectedColumn> injectedColumns_;
 
   /// Tracks the absolute row offset within the data file. Each chunk advances

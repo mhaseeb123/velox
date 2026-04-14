@@ -286,62 +286,72 @@ size_t CudfSplitReader::completedRows() const {
   return completedRows_;
 }
 
-void CudfSplitReader::setupCudfDataSourceAndOptions() {
-  // Build source info for the chunked parquet reader
-  auto sourceInfo = [&]() {
-    // Use file data source if we don't want to use the BufferedInput source
-    if (not cudfHiveConfig_->useBufferedInputSession(
-            connectorQueryCtx_->sessionProperties())) {
-      VLOG(1) << "Using file data source for CudfSplitReader";
-      return cudf::io::source_info{split_->filePath};
-    }
-
-    auto fileHandleCachePtr = FileHandleCachedPtr{};
-    try {
-      const auto fileHandleKey = FileHandleKey{
-          .filename = split_->filePath,
-          .tokenProvider = connectorQueryCtx_->fsTokenProvider()};
-      auto fileProperties = FileProperties{};
-      fileHandleCachePtr = fileHandleFactory_->generate(
-          fileHandleKey, &fileProperties, ioStats_ ? ioStats_.get() : nullptr);
-      VELOX_CHECK_NOT_NULL(fileHandleCachePtr.get());
-    } catch (const VeloxRuntimeError& e) {
-      LOG(WARNING) << fmt::format(
-          "Failed to generate file handle cache for file {}, falling back to file data source for CudfSplitReader",
-          split_->filePath);
-      return cudf::io::source_info{split_->filePath};
-    }
-
-    // Here we keep adding new entries to CacheTTLController when new
-    // fileHandles are generated, if CacheTTLController was created. Creator of
-    // CacheTTLController needs to make sure a size control strategy was
-    // available such as removing aged out entries.
-    if (auto* cacheTTLController = cache::CacheTTLController::getInstance()) {
-      cacheTTLController->addOpenFileInfo(fileHandleCachePtr->uuid.id());
-    }
-
-    auto bufferedInput =
-        velox::connector::hive::BufferedInputBuilder::getInstance()->create(
-            *fileHandleCachePtr,
-            baseReaderOpts_,
-            connectorQueryCtx_,
-            ioStatistics_,
-            ioStats_,
-            executor_);
-    if (not bufferedInput) {
-      LOG(WARNING) << fmt::format(
-          "Failed to create buffered input source for file {}, falling back to file data source for CudfSplitReader",
-          split_->filePath);
-      return cudf::io::source_info{split_->filePath};
-    }
-    dataSource_ =
-        std::make_unique<BufferedInputDataSource>(std::move(bufferedInput));
-    return cudf::io::source_info{dataSource_.get()};
-  }();
-
-  if (dataSource_ == nullptr) {
-    dataSource_ = std::move(cudf::io::make_datasources(sourceInfo).front());
+void CudfSplitReader::setupCudfDataSource() {
+  if (dataSource_) {
+    return;
   }
+
+  // Use file data source if we don't want to use the BufferedInput source
+  if (not cudfHiveConfig_->useBufferedInputSession(
+          connectorQueryCtx_->sessionProperties())) {
+    VLOG(1) << "Using file data source for CudfSplitReader";
+    dataSource_ = std::move(
+        cudf::io::make_datasources(cudf::io::source_info{split_->filePath})
+            .front());
+    return;
+  }
+
+  auto fileHandleCachePtr = FileHandleCachedPtr{};
+  try {
+    const auto fileHandleKey = FileHandleKey{
+        .filename = split_->filePath,
+        .tokenProvider = connectorQueryCtx_->fsTokenProvider()};
+    auto fileProperties = FileProperties{};
+    fileHandleCachePtr = fileHandleFactory_->generate(
+        fileHandleKey, &fileProperties, ioStats_ ? ioStats_.get() : nullptr);
+    VELOX_CHECK_NOT_NULL(fileHandleCachePtr.get());
+  } catch (const VeloxRuntimeError& e) {
+    LOG(WARNING) << fmt::format(
+        "Failed to generate file handle cache for file {}, falling back to file data source for CudfSplitReader",
+        split_->filePath);
+    dataSource_ = std::move(
+        cudf::io::make_datasources(cudf::io::source_info{split_->filePath})
+            .front());
+    return;
+  }
+
+  // Here we keep adding new entries to CacheTTLController when new
+  // fileHandles are generated, if CacheTTLController was created. Creator of
+  // CacheTTLController needs to make sure a size control strategy was
+  // available such as removing aged out entries.
+  if (auto* cacheTTLController = cache::CacheTTLController::getInstance()) {
+    cacheTTLController->addOpenFileInfo(fileHandleCachePtr->uuid.id());
+  }
+
+  auto bufferedInput =
+      velox::connector::hive::BufferedInputBuilder::getInstance()->create(
+          *fileHandleCachePtr,
+          baseReaderOpts_,
+          connectorQueryCtx_,
+          ioStatistics_,
+          ioStats_,
+          executor_);
+  if (not bufferedInput) {
+    LOG(WARNING) << fmt::format(
+        "Failed to create buffered input source for file {}, falling back to file data source for CudfSplitReader",
+        split_->filePath);
+    dataSource_ = std::move(
+        cudf::io::make_datasources(cudf::io::source_info{split_->filePath})
+            .front());
+    return;
+  }
+  dataSource_ =
+      std::make_unique<BufferedInputDataSource>(std::move(bufferedInput));
+}
+
+void CudfSplitReader::setupReaderOptions() {
+  // Build source_info from the already-constructed datasource.
+  auto sourceInfo = cudf::io::source_info{dataSource_.get()};
 
   // Reader options
   readerOptions_ =
@@ -373,7 +383,8 @@ void CudfSplitReader::setupCudfDataSourceAndOptions() {
 
 void CudfSplitReader::createCudfReader(
     rmm::device_async_resource_ref output_mr) {
-  setupCudfDataSourceAndOptions();
+  setupCudfDataSource();
+  setupReaderOptions();
   // Create a parquet reader
   splitReader_ = std::make_unique<cudf::io::chunked_parquet_reader>(
       cudfHiveConfig_->maxChunkReadLimit(),
@@ -384,7 +395,8 @@ void CudfSplitReader::createCudfReader(
 }
 
 void CudfSplitReader::createExperimentalReader() {
-  setupCudfDataSourceAndOptions();
+  setupCudfDataSource();
+  setupReaderOptions();
   // Create a hybrid scan reader
   nvtxRangePush("hybridScanReader");
   auto const footerBuffer = fetchFooterBytes(dataSource_);

@@ -86,8 +86,11 @@ class CudfSplitReader : public NvtxHelper {
   size_t completedRows() const;
 
  protected:
-  // Setup the cuDF data source and options
-  void setupCudfDataSourceAndOptions();
+  /// Setup the cuDF data source
+  void setupCudfDataSource();
+
+  /// Setup the cuDF reader options
+  void setupReaderOptions();
 
   /// Create the chunked parquet reader.
   virtual void createCudfReader(rmm::device_async_resource_ref output_mr);

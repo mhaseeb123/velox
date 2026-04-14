@@ -22,6 +22,7 @@
 
 #include "velox/common/base/tests/GTestUtils.h"
 #include "velox/common/file/FileSystems.h"
+#include "velox/connectors/hive/TableHandle.h"
 #include "velox/connectors/hive/iceberg/IcebergDeleteFile.h"
 #include "velox/connectors/hive/iceberg/IcebergMetadataColumns.h"
 #include "velox/connectors/hive/iceberg/IcebergSplit.h"
@@ -35,6 +36,8 @@
 using namespace facebook::velox::exec::test;
 using namespace facebook::velox::exec;
 using namespace facebook::velox::connector::hive::iceberg;
+using facebook::velox::common::testutil::TempFilePath;
+using facebook::velox::connector::hive::HiveColumnHandle;
 
 namespace facebook::velox::cudf_velox::exec::test {
 
@@ -1045,6 +1048,136 @@ TEST_F(CudfIcebergReadTest, insertDeleteInsertInterleaving) {
   });
 
   assertEqualResults({expected}, {result});
+}
+
+TEST_F(CudfIcebergReadTest, schemaEvolutionRemoveColumn) {
+  auto oldRowType = ROW({"c0", "c1", "c2"}, {BIGINT(), INTEGER(), VARCHAR()});
+  auto newRowType = ROW({"c0", "c2"}, {BIGINT(), VARCHAR()});
+
+  // Write data file with old schema (c0, c1, c2).
+  auto dataVector = makeRowVector(
+      oldRowType->names(),
+      {
+          makeFlatVector<int64_t>({1, 2, 3, 4, 5}),
+          makeFlatVector<int32_t>({10, 20, 30, 40, 50}),
+          makeFlatVector<std::string>({"a", "b", "c", "d", "e"}),
+      });
+
+  auto dataFilePath = TempFilePath::create();
+  writeToFile(dataFilePath->getPath(), dataVector);
+
+  auto icebergSplits = makeIcebergSplits(dataFilePath->getPath());
+
+  // Expected result: c0 and c2 have values, c1 is not present.
+  auto expected = makeRowVector(
+      newRowType->names(),
+      {
+          dataVector->childAt(0),
+          dataVector->childAt(2),
+      });
+
+  // Read with new schema (c0 and c2 only, c1 removed).
+  auto plan = PlanBuilder()
+                  .startTableScan()
+                  .connectorId(kCudfIcebergConnectorId)
+                  .outputType(newRowType)
+                  .endTableScan()
+                  .planNode();
+  AssertQueryBuilder(plan).splits(icebergSplits).assertResults({expected});
+}
+
+TEST_F(CudfIcebergReadTest, schemaEvolutionAddColumns) {
+  auto oldRowType = ROW({"c0"}, {BIGINT()});
+  auto newRowType = ROW({"c0", "c1", "c2"}, {BIGINT(), INTEGER(), VARCHAR()});
+
+  // Write data file with old schema (only c0).
+  auto dataVector = makeRowVector({
+      makeFlatVector<int64_t>({100, 200, 300}),
+  });
+  auto dataFilePath = TempFilePath::create();
+  writeToFile(dataFilePath->getPath(), dataVector);
+  auto icebergSplits = makeIcebergSplits(dataFilePath->getPath());
+
+  // Expected result: c0 has values, c1 and c2 are NULL.
+  auto expected = makeRowVector({
+      dataVector->childAt(0),
+      makeNullConstant(TypeKind::INTEGER, 3),
+      makeNullConstant(TypeKind::VARCHAR, 3),
+  });
+
+  // Read with new schema (c0, c1, and c2).
+  auto plan = PlanBuilder()
+                  .startTableScan()
+                  .connectorId(kCudfIcebergConnectorId)
+                  .outputType(newRowType)
+                  .dataColumns(newRowType)
+                  .endTableScan()
+                  .planNode();
+  AssertQueryBuilder(plan).splits(icebergSplits).assertResults({expected});
+}
+
+// Test reading partition columns from Hive-migrated tables.
+// This tests the adaptColumns method handling partition columns that are not
+// stored in the data file but provided via partitionKeys map.
+// This scenario occurs when reading Hive-written data files where partition
+// column values are stored in partition metadata rather than in the data file.
+TEST_F(CudfIcebergReadTest, partitionColumnsFromHive) {
+  auto fileRowType = ROW({"c0", "c1"}, {BIGINT(), INTEGER()});
+  auto tableRowType =
+      ROW({"c0", "c1", "region", "year"},
+          {BIGINT(), INTEGER(), VARCHAR(), INTEGER()});
+
+  // Write data file with only non-partition columns (c0, c1).
+  auto dataVector = makeRowVector({
+      makeFlatVector<int64_t>({1, 2, 3}),
+      makeFlatVector<int32_t>({10, 20, 30}),
+  });
+  auto dataFilePath = TempFilePath::create();
+  writeToFile(dataFilePath->getPath(), dataVector);
+
+  // Set partition keys for region and year.
+  std::unordered_map<std::string, std::optional<std::string>> partitionKeys;
+  partitionKeys["region"] = "US";
+  partitionKeys["year"] = "2025";
+
+  auto icebergSplits =
+      makeIcebergSplits(dataFilePath->getPath(), {}, partitionKeys);
+
+  // Build column handles marking partition columns.
+  facebook::velox::connector::ColumnHandleMap assignments;
+  for (uint32_t i = 0; i < tableRowType->size(); ++i) {
+    const auto& name = tableRowType->nameOf(i);
+    auto columnType = (i >= fileRowType->size())
+        ? HiveColumnHandle::ColumnType::kPartitionKey
+        : HiveColumnHandle::ColumnType::kRegular;
+    assignments[name] = std::make_shared<HiveColumnHandle>(
+        name,
+        columnType,
+        tableRowType->childAt(i),
+        tableRowType->childAt(i),
+        std::vector<common::Subfield>{});
+  }
+
+  // Expected result: c0 and c1 from file, region and year from partition keys.
+  auto expected = makeRowVector(
+      tableRowType->names(),
+      {
+          dataVector->childAt(0),
+          dataVector->childAt(1),
+          makeFlatVector<std::string>({"US", "US", "US"}),
+          makeFlatVector<int32_t>({2025, 2025, 2025}),
+      });
+
+  // Read with table schema including partition columns.
+  auto plan = PlanBuilder()
+                  .startTableScan()
+                  .connectorId(kCudfIcebergConnectorId)
+                  .outputType(tableRowType)
+                  .dataColumns(tableRowType)
+                  .assignments(assignments)
+                  .endTableScan()
+                  .planNode();
+  AssertQueryBuilder(plan).splits(icebergSplits).assertResults({expected});
 }
 
 } // namespace facebook::velox::cudf_velox::exec::test

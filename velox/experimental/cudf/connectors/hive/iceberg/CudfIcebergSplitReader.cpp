@@ -29,6 +29,7 @@
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/io/parquet.hpp>
+#include <cudf/io/parquet_metadata.hpp>
 #include <cudf/null_mask.hpp>
 #include <cudf/scalar/scalar_factories.hpp>
 #include <cudf/stream_compaction.hpp>
@@ -127,10 +128,10 @@ void CudfIcebergSplitReader::prepareSplit() {
   // `prepareSplit`
   setupColumnProjection();
 
-  // Detect partition columns and schema-evolution missing columns.
-  // Filters partition columns from readColumnNames_ so the parquet reader
+  // Detect info columns, partition columns, and schema-evolution missing
+  // columns. Filters them from readColumnNames_ so the parquet reader
   // doesn't try to read them, and records them for post-read injection.
-  setupSchemaReconciliation();
+  adaptColumns();
 
   // Call base to setup stream, datasource, options, and the cudf reader
   CudfSplitReader::prepareSplit();
@@ -197,24 +198,19 @@ CudfIcebergSplitReader::readNextChunk(
         cudfTable->view(), rowMask_->view(), stream_, get_output_mr());
   }
 
+  // Strip extra equality delete key columns added by
+  // setupColumnProjection()
+  if (not extraEqualityColumns_.empty()) {
+    auto columns = cudfTable->release();
+    columns.resize(columns.size() - extraEqualityColumns_.size());
+    cudfTable = std::make_unique<cudf::table>(std::move(columns));
+  }
+
   // Inject partition columns and schema-evolution NULL columns.
-  // Missing columns were detected during setupSchemaReconciliation().
   // This must run even for 0-row tables so post-delete empty chunks still
   // have the expected number and order of output columns.
   if (not injectedColumns_.empty()) {
     cudfTable = injectMissingColumns(std::move(cudfTable), output_mr);
-  }
-
-  // Strip any extra equality delete key columns that were added
-  if (not extraEqualityColumns_.empty()) {
-    VELOX_CHECK_EQ(
-        extraEqualityColumns_.size(),
-        cudfTable->num_columns() - outputType_->size(),
-        "Unexpected number of extra equality delete key columns: {}",
-        extraEqualityColumns_.size());
-    auto columns = cudfTable->release();
-    columns.resize(outputType_->size());
-    cudfTable = std::make_unique<cudf::table>(std::move(columns));
   }
 
   // Update the base read offset
@@ -463,162 +459,153 @@ void CudfIcebergSplitReader::setupColumnProjection() {
       extraEqualityColumns_.end());
 }
 
-void CudfIcebergSplitReader::setupSchemaReconciliation() {
-  // Identify partition columns and schema-evolution missing columns.
-  // Partition columns come from the split metadata; missing columns are
-  // detected by reading the parquet file's schema (footer only).
-
-  // 1. Detect partition columns
+void CudfIcebergSplitReader::adaptColumns() {
+  // Detect info columns and partition columns
+  std::unordered_set<std::string> injectedNames;
   for (size_t i = 0; i < outputType_->size(); ++i) {
-    const auto& name = outputType_->nameOf(i);
-    auto partIt = icebergSplit_->partitionKeys.find(name);
-    if (partIt != icebergSplit_->partitionKeys.end()) {
+    const auto& fieldName = outputType_->nameOf(i);
+
+    if (auto iter = split_->infoColumns.find(fieldName);
+        iter != split_->infoColumns.end()) {
       injectedColumns_.push_back(
-          {i, name, partIt->second, outputType_->childAt(i)});
+          {i, fieldName, iter->second, outputType_->childAt(i)});
+      injectedNames.insert(fieldName);
+    } else if (auto it = icebergSplit_->partitionKeys.find(fieldName);
+               it != icebergSplit_->partitionKeys.end()) {
+      // Partition columns: Hive migrated table. In Hive-written data
+      // files, partition column values are stored in partition metadata
+      // rather than in the data file itself, following Hive's
+      // partitioning convention.
+      injectedColumns_.push_back(
+          {i, fieldName, it->second, outputType_->childAt(i)});
+      injectedNames.insert(fieldName);
     }
   }
 
-  // 2. Detect schema-evolution missing columns by reading the parquet
-  //    file's schema. Read 0 rows to get just the column names from the
-  //    footer without reading any data.
-  {
-    std::unordered_set<std::string> injectedNames;
-    for (const auto& col : injectedColumns_) {
-      injectedNames.insert(col.name);
-    }
-
-    // TODO(ducndh): This bypasses the BufferedInput/token-provider path used
-    // by the main reader when useBufferedInputSession() is enabled. It will
-    // fail on non-local filesystems (S3/HDFS). When adding remote filesystem
-    // support, use the same datasource construction as the main reader.
-    auto opts = cudf::io::parquet_reader_options::builder(
-                    cudf::io::source_info{split_->filePath})
-                    .num_rows(0)
-                    .build();
-    auto meta = cudf::io::read_parquet(opts, stream_, get_temp_mr());
+  // Detect schema-evolution missing columns by reading the parquet
+  // footer. Only needed if there are output columns not yet accounted for.
+  if (injectedNames.size() < outputType_->size()) {
+    setupCudfDataSource();
+    auto meta = cudf::io::read_parquet_metadata(
+        cudf::io::source_info{dataSource_.get()});
+    const auto& rootSchema = meta.schema().root();
     std::unordered_set<std::string> fileColumns;
-    for (const auto& si : meta.metadata.schema_info) {
-      fileColumns.insert(si.name);
-    }
+    fileColumns.reserve(rootSchema.num_children());
+    std::transform(
+        rootSchema.children().begin(),
+        rootSchema.children().end(),
+        std::inserter(fileColumns, fileColumns.end()),
+        [](const auto& col) { return col.name(); });
 
     for (size_t i = 0; i < outputType_->size(); ++i) {
-      const auto& name = outputType_->nameOf(i);
-      if (injectedNames.count(name) > 0) {
-        continue; // Already handled as partition column
+      const auto& fieldName = outputType_->nameOf(i);
+      if (injectedNames.contains(fieldName)) {
+        continue;
       }
-      if (fileColumns.count(name) == 0) {
-        // Column not in parquet file — schema evolution: inject NULL
+      if (not fileColumns.contains(fieldName)) {
+        // Schema evolution: Column was added after the data file was written
+        // and doesn't exist in older data files.
         injectedColumns_.push_back(
-            {i, name, std::nullopt, outputType_->childAt(i)});
-        injectedNames.insert(name);
+            {i, fieldName, std::nullopt, outputType_->childAt(i)});
+        injectedNames.insert(fieldName);
       }
     }
   }
 
-  // 3. Remove all injected columns from readColumnNames_
+  // Remove all injected columns from readColumnNames_
   if (not injectedColumns_.empty()) {
-    std::unordered_set<std::string> injectedNames;
-    for (const auto& col : injectedColumns_) {
-      injectedNames.insert(col.name);
-    }
-    std::vector<std::string> filtered;
-    filtered.reserve(readColumnNames_.size());
-    for (const auto& name : readColumnNames_) {
-      if (injectedNames.count(name) == 0) {
-        filtered.push_back(name);
-      }
-    }
-    readColumnNames_ = std::move(filtered);
+    std::erase_if(readColumnNames_, [&injectedNames](const auto& name) {
+      return injectedNames.contains(name);
+    });
   }
 }
 
 std::unique_ptr<cudf::table> CudfIcebergSplitReader::injectMissingColumns(
-    std::unique_ptr<cudf::table> table,
+    std::unique_ptr<cudf::table>&& table,
     rmm::device_async_resource_ref mr) {
   const auto numRows = table->num_rows();
   auto columns = table->release();
 
-  // Total output columns = data columns from parquet + injected columns +
-  // extra equality columns
+  // Creates a scalar from a string partition value for the given cudf type.
+  auto makePartitionScalar =
+      [&](const std::string& value,
+          cudf::data_type cudfType,
+          const InjectedColumn& col) -> std::unique_ptr<cudf::scalar> {
+    VELOX_CHECK(
+        cudfType.id() == cudf::type_id::STRING or
+            cudfType.id() == cudf::type_id::INT32 or
+            cudfType.id() == cudf::type_id::INT64,
+        "Unsupported partition column type: column '{}', type {}",
+        col.name,
+        col.veloxType->toString());
+    try {
+      switch (cudfType.id()) {
+        case cudf::type_id::STRING:
+          return std::make_unique<cudf::string_scalar>(
+              value, true, stream_, mr);
+        case cudf::type_id::INT32:
+          return std::make_unique<cudf::numeric_scalar<int32_t>>(
+              folly::to<int32_t>(value), true, stream_, mr);
+        case cudf::type_id::INT64:
+          return std::make_unique<cudf::numeric_scalar<int64_t>>(
+              folly::to<int64_t>(value), true, stream_, mr);
+        default:
+          VELOX_UNREACHABLE();
+      }
+    } catch (const std::exception& e) {
+      VELOX_FAIL(
+          "Bad partition value '{}' for column '{}' (type {}): {}",
+          value,
+          col.name,
+          col.veloxType->toString(),
+          e.what());
+    }
+  };
+
+  // Merge data columns and injected constant columns in output order.
   const auto totalColumns = columns.size() + injectedColumns_.size();
   std::vector<std::unique_ptr<cudf::column>> output;
   output.reserve(totalColumns);
 
-  // Merge data columns and injected columns in the correct output order.
-  // injectedColumns_ stores the output index where each injected column goes.
-  size_t dataIdx = 0;
-  size_t injIdx = 0;
+  // Sort injected columns by output index for sequential interleaving.
+  std::sort(
+      injectedColumns_.begin(),
+      injectedColumns_.end(),
+      [](const auto& a, const auto& b) {
+        return a.outputIndex < b.outputIndex;
+      });
 
-  // Sort injected columns by output index for sequential insertion
-  auto sorted = injectedColumns_;
-  std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) {
-    return a.outputIndex < b.outputIndex;
-  });
+  auto injectedColIter = injectedColumns_.begin();
+  auto dataColIter = columns.begin();
 
   for (size_t outIdx = 0; outIdx < totalColumns; ++outIdx) {
-    if (injIdx < sorted.size() && sorted[injIdx].outputIndex == outIdx) {
-      // Inject a constant column
-      auto cudfType = cudf_velox::veloxToCudfDataType(sorted[injIdx].veloxType);
-      if (sorted[injIdx].partitionValue.has_value()) {
-        // Partition column: create constant with the partition value.
-        const auto& value = sorted[injIdx].partitionValue.value();
-        std::unique_ptr<cudf::scalar> scalar;
-        const auto& colName = sorted[injIdx].name;
-        try {
-          if (cudfType.id() == cudf::type_id::STRING) {
-            scalar =
-                std::make_unique<cudf::string_scalar>(value, true, stream_, mr);
-          } else if (cudfType.id() == cudf::type_id::INT64) {
-            scalar = std::make_unique<cudf::numeric_scalar<int64_t>>(
-                std::stoll(value), true, stream_, mr);
-          } else if (cudfType.id() == cudf::type_id::INT32) {
-            scalar = std::make_unique<cudf::numeric_scalar<int32_t>>(
-                std::stoi(value), true, stream_, mr);
-          } else {
-            VELOX_FAIL(
-                "Unsupported partition column type for constant injection: "
-                "column '{}', type {}",
-                colName,
-                sorted[injIdx].veloxType->toString());
-          }
-        } catch (const std::invalid_argument& e) {
-          VELOX_FAIL(
-              "Invalid partition value for column '{}' (type {}): '{}'",
-              colName,
-              sorted[injIdx].veloxType->toString(),
-              value);
-        } catch (const std::out_of_range& e) {
-          VELOX_FAIL(
-              "Partition value out of range for column '{}' (type {}): '{}'",
-              colName,
-              sorted[injIdx].veloxType->toString(),
-              value);
-        }
-        output.push_back(
-            cudf::make_column_from_scalar(*scalar, numRows, stream_, mr));
+    if (injectedColIter != injectedColumns_.end() &&
+        injectedColIter->outputIndex == outIdx) {
+      const auto& col = *injectedColIter;
+      auto cudfType = cudf_velox::veloxToCudfDataType(col.veloxType);
+
+      std::unique_ptr<cudf::scalar> scalar;
+      if (col.partitionValue.has_value()) {
+        scalar = makePartitionScalar(col.partitionValue.value(), cudfType, col);
       } else {
-        // Schema evolution: create all-NULL column
-        auto scalar =
-            cudf::make_default_constructed_scalar(cudfType, stream_, mr);
+        scalar = cudf::make_default_constructed_scalar(cudfType, stream_, mr);
         scalar->set_valid_async(false, stream_);
-        output.push_back(
-            cudf::make_column_from_scalar(*scalar, numRows, stream_, mr));
       }
-      ++injIdx;
+      output.push_back(
+          cudf::make_column_from_scalar(*scalar, numRows, stream_, mr));
+      injectedColIter++;
     } else {
-      // Data column from parquet
-      VELOX_CHECK_LT(
-          dataIdx,
-          columns.size(),
-          "Data column index out of range during schema reconciliation");
-      output.push_back(std::move(columns[dataIdx++]));
+      VELOX_CHECK(
+          dataColIter != columns.end(),
+          "Data column index out of range during column injection");
+      output.push_back(std::move(*dataColIter));
+      dataColIter++;
     }
   }
 
-  // Append any remaining data columns (extra equality columns)
-  while (dataIdx < columns.size()) {
-    output.push_back(std::move(columns[dataIdx++]));
-  }
+  VELOX_CHECK(
+      dataColIter == columns.end(),
+      "Not all data columns were consumed during column injection");
 
   return std::make_unique<cudf::table>(std::move(output));
 }
