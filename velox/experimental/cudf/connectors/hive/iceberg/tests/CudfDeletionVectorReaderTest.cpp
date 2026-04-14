@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "velox/experimental/cudf/CudfNoDefaults.h"
 #include "velox/experimental/cudf/connectors/hive/iceberg/CudfDeletionVectorReader.h"
 
 #include "velox/common/base/BitUtil.h"
@@ -280,18 +281,15 @@ std::unique_ptr<cudf::table> applyDeletionVector(
 class CudfDeletionVectorReaderTest : public ::testing::Test {
  protected:
   static void SetUpTestSuite() {
-    if (!memory::MemoryManager::testInstance()) {
-      memory::MemoryManager::initialize(memory::MemoryManager::Options{});
-    }
+    memory::MemoryManager::initialize(memory::MemoryManager::Options{});
   }
 
   void SetUp() override {
     filesystems::registerLocalFileSystem();
-    stream_ = cudf::get_default_stream();
-    mr_ = rmm::mr::get_current_device_resource_ref();
   }
 
-  rmm::cuda_stream_view stream_;
+  rmm::cuda_stream_view stream_{
+      cudf::get_default_stream(cudf::allow_default_stream)};
   rmm::device_async_resource_ref mr_{
       rmm::mr::get_current_device_resource_ref()};
 };
