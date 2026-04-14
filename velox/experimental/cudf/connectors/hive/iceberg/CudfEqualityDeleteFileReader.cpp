@@ -201,12 +201,6 @@ void CudfEqualityDeleteFileReader::buildHashJoin(rmm::cuda_stream_view stream) {
   // distinct_hash_join treats all NaNs as equal by default.
   deleteHashJoin_ = std::make_unique<cudf::distinct_hash_join>(
       deleteKeyTable_->view(), cudf::null_equality::EQUAL, 0.5, stream);
-
-  // NOTE: Do NOT reset deleteKeyTable_ here. distinct_hash_join stores a
-  // view (reference) to the build table, not a copy. Destroying the table
-  // would leave the hash join with a dangling reference, causing incorrect
-  // results for multi-column keys (the probe needs the original column data
-  // to verify matches after hash collisions).
 }
 
 void CudfEqualityDeleteFileReader::buildEqualityColumnIndices(
@@ -237,9 +231,8 @@ void CudfEqualityDeleteFileReader::buildEqualityColumnIndices(
 void CudfEqualityDeleteFileReader::applyDeletes(
     cudf::table_view table,
     const std::vector<std::string>& inputColumnNames,
-    std::shared_ptr<rmm::device_buffer> rowMask,
-    rmm::cuda_stream_view stream,
-    rmm::device_async_resource_ref mr) {
+    cudf::mutable_column_view const& rowMask,
+    rmm::cuda_stream_view stream) {
   const auto numRows = table.num_rows();
   if (empty() or numRows == 0) {
     return;
@@ -254,15 +247,11 @@ void CudfEqualityDeleteFileReader::applyDeletes(
   // side to know which data rows to delete.
   const auto probeTable = table.select(equalityColumnIndices_);
   const auto probeIndices =
-      deleteHashJoin_->inner_join(probeTable, stream, mr).first;
+      deleteHashJoin_->inner_join(probeTable, stream, get_temp_mr()).first;
 
   // Clear `rowMask` at probe positions if any
   if (not probeIndices->is_empty()) {
-    scatterDeletesToRowMask(
-        cudf::device_span<bool>(static_cast<bool*>(rowMask->data()), numRows),
-        *probeIndices,
-        stream,
-        get_temp_mr());
+    scatterDeletesToRowMask(rowMask, *probeIndices, stream, get_temp_mr());
   }
 }
 

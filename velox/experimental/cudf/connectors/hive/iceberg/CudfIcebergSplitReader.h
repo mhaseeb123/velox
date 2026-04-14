@@ -81,15 +81,14 @@ class CudfIcebergSplitReader : public CudfSplitReader {
   /// deletion vectors.
   void setupDeleteFileReaders();
 
+  /// Apply deletion vector (V3) to the input cudf table.
+  void applyDeletionVector(cudf::table_view input);
+
   /// Apply positional deletes (V2) to the input cudf table.
-  std::unique_ptr<cudf::table> applyPositionalDeletes(
-      cudf::table_view input,
-      rmm::device_async_resource_ref output_mr);
+  void applyPositionalDeletes(cudf::table_view input);
 
   /// Apply equality deletes (V2) to the input cudf table.
-  std::unique_ptr<cudf::table> applyEqualityDeletes(
-      cudf::table_view input,
-      rmm::device_async_resource_ref output_mr);
+  void applyEqualityDeletes(cudf::table_view input);
 
   /// Setup column projection to include any equality delete key columns
   /// that are not already in the output projection.
@@ -129,9 +128,10 @@ class CudfIcebergSplitReader : public CudfSplitReader {
   /// Describes a column that must be injected after reading because it is
   /// not present in the parquet file (partition column or schema evolution).
   struct InjectedColumn {
-    size_t outputIndex;  // position in the final output schema
+    size_t outputIndex; // position in the final output schema
     std::string name;
-    std::optional<std::string> partitionValue;  // nullopt = NULL (schema evolution)
+    std::optional<std::string>
+        partitionValue; // nullopt = NULL (schema evolution)
     TypePtr veloxType;
   };
 
@@ -144,7 +144,7 @@ class CudfIcebergSplitReader : public CudfSplitReader {
 
   BufferPtr deleteBitmap_{nullptr};
   std::shared_ptr<rmm::device_buffer> deviceDeleteBitmap_;
-  std::shared_ptr<rmm::device_buffer> rowMask_;
+  std::unique_ptr<cudf::column> rowMask_;
 };
 
 } // namespace facebook::velox::cudf_velox::connector::hive::iceberg

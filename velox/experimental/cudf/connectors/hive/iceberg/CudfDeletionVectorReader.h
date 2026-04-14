@@ -63,29 +63,19 @@ class CudfDeletionVectorReader {
     return loaded_;
   }
 
-  /// Applies the deletion vector to a cudf table chunk.
+  /// Updates the deleted positions in the row mask in-place
   ///
-  /// @param table The cudf table chunk to filter.
+  /// @param rowMask Mutable boolean mask column on device.
   /// @param startRow Absolute row index of the first row in this chunk.
-  /// @param rowMask Shared boolean mask buffer on device.
+  /// @param numRows Number of rows in the table chunk.
   /// @param stream CUDA stream for kernel launches.
-  /// @param mr Device memory resource for the output table.
-  /// @return A new cudf table with deleted rows removed.
-  std::unique_ptr<cudf::table> applyDeletionVector(
-      cudf::table_view const& table,
+  /// @param temp_mr Device memory resource for temporary allocations.
+  void applyDeletes(
+      cudf::mutable_column_view const& rowMask,
       std::size_t startRow,
-      std::shared_ptr<rmm::device_buffer> rowMask,
+      std::size_t numRows,
       rmm::cuda_stream_view stream,
-      rmm::device_async_resource_ref mr);
-
-  /// Marks deleted positions in the shared row mask WITHOUT filtering the
-  /// table. For each row in [startRow, startRow+numRows), sets rowMask[i]
-  /// to false if that absolute position is in the deletion vector.
-  void markDeletionVector(
-      std::shared_ptr<rmm::device_buffer> rowMask,
-      std::size_t startRow,
-      cudf::size_type numRows,
-      rmm::cuda_stream_view stream);
+      rmm::device_async_resource_ref temp_mr);
 
   /// Field IDs used to encode DV blob offset and length in the
   /// IcebergDeleteFile bounds maps. The coordinator encodes these when
@@ -120,8 +110,8 @@ class CudfDeletionVectorReader {
   /// Opaque wrapper class for cuco's 32 or 64 bit roaring bitmap
   std::unique_ptr<RoaringBitmapImpl, RoaringBitmapDeleter> bitmap_;
 
-  /// Device buffer for the row indices vector.
-  std::unique_ptr<rmm::device_buffer> rowIndices_;
+  /// Row indices column
+  std::unique_ptr<cudf::column> rowIndices_;
 
   /// Deletion vector file metadata.
   struct {

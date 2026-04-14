@@ -58,9 +58,8 @@ namespace velox_hive = ::facebook::velox::connector::hive;
 /// delete set. The reader eagerly loads all delete key tuples from the file
 /// into a CPU or GPU table (for Parquet formats only) during construction.
 /// A `cudf::distinct_hash_join` is lazily built on the first call to
-/// applyDeletes() after CPU to GPU table conversion if needed. The tables are
-/// freed after construction and the hash join is reused across batches for
-/// efficient anti-join probing.
+/// applyDeletes() after CPU to GPU table conversion if needed. CPU table is
+/// freed after construction.
 ///
 /// The equality delete column names are resolved from equalityFieldIds via
 /// the table schema provided by the caller.
@@ -110,15 +109,13 @@ class CudfEqualityDeleteFileReader {
   /// @param table Base cudf table view to filter.
   /// @param inputColumnNames Column names of the input table, used to
   ///   resolve equality column indices.
-  /// @param rowMask Device buffer of booleans; surviving rows are true.
+  /// @param rowMask Mutable view of row mask column.
   /// @param stream CUDA stream for kernel launches.
-  /// @param mr Device memory resource for temporary allocations.
   void applyDeletes(
       cudf::table_view table,
       const std::vector<std::string>& inputColumnNames,
-      std::shared_ptr<rmm::device_buffer> rowMask,
-      rmm::cuda_stream_view stream,
-      rmm::device_async_resource_ref mr);
+      cudf::mutable_column_view const& rowMask,
+      rmm::cuda_stream_view stream);
 
   /// Returns the number of delete key tuples loaded from the file.
   size_t numDeleteKeys() const {

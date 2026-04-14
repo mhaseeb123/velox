@@ -32,20 +32,21 @@ namespace facebook::velox::cudf_velox::connector::hive::iceberg {
 
 namespace {
 
-/// Functor to check if the bit at `index` is clear. i.e., the row
-/// is NOT deleted.
+/// Functor to apply deletion bitmap to the row mask. A row is surviving if it
+/// was previously surviving and the bit at `index` is clear.
 struct IsSurvivingRow {
   const cudf::bitmask_type* bitmask;
-  __device__ bool operator()(cudf::size_type index) const noexcept {
-    return not cudf::bit_is_set(bitmask, index);
+  __device__ bool operator()(cudf::size_type index, bool wasSurviving)
+      const noexcept {
+    return wasSurviving and not cudf::bit_is_set(bitmask, index);
   }
 };
 
 } // namespace
 
-void convertDeletionBitmapToRowMask(
+void applyDeletionBitmapToRowMask(
     cudf::device_span<cudf::bitmask_type const> deviceBitmap,
-    cudf::device_span<bool> rowMask,
+    cudf::mutable_column_view const& rowMask,
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref temp_mr) {
   // Alternate: Use `cudf::mask_to_bools` but it produces a new column.
@@ -54,12 +55,13 @@ void convertDeletionBitmapToRowMask(
       rmm::exec_policy_nosync(stream, temp_mr),
       iter,
       iter + rowMask.size(),
-      rowMask.begin(),
+      rowMask.begin<bool>(),
+      rowMask.begin<bool>(),
       IsSurvivingRow{deviceBitmap.data()});
 }
 
 void scatterDeletesToRowMask(
-    cudf::device_span<bool> rowMask,
+    cudf::mutable_column_view const& rowMask,
     cudf::device_span<cudf::size_type const> indices,
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref temp_mr) {
@@ -70,36 +72,7 @@ void scatterDeletesToRowMask(
       iter,
       iter + indices.size(),
       indices.begin(),
-      rowMask.begin());
-}
-
-namespace {
-
-/// Clears a row mask bit if the corresponding deletion bitmap bit is set.
-/// Preserves existing false values (AND semantics).
-struct MergeBitmapIntoMask {
-  const cudf::bitmask_type* bitmask;
-  __device__ bool operator()(cudf::size_type index, bool currentMask) const
-      noexcept {
-    return currentMask and not cudf::bit_is_set(bitmask, index);
-  }
-};
-
-} // namespace
-
-void mergeDeletionBitmapIntoRowMask(
-    cudf::device_span<cudf::bitmask_type const> deviceBitmap,
-    cudf::device_span<bool> rowMask,
-    rmm::cuda_stream_view stream,
-    rmm::device_async_resource_ref temp_mr) {
-  auto iter = cuda::counting_iterator{0};
-  thrust::transform(
-      rmm::exec_policy_nosync(stream, temp_mr),
-      iter,
-      iter + rowMask.size(),
-      rowMask.begin(),
-      rowMask.begin(),
-      MergeBitmapIntoMask{deviceBitmap.data()});
+      rowMask.begin<bool>());
 }
 
 } // namespace facebook::velox::cudf_velox::connector::hive::iceberg

@@ -23,7 +23,10 @@
 #include "velox/common/testutil/TempFilePath.h"
 #include "velox/connectors/hive/iceberg/IcebergDeleteFile.h"
 
+#include <cudf/column/column_factories.hpp>
 #include <cudf/column/column_view.hpp>
+#include <cudf/scalar/scalar.hpp>
+#include <cudf/stream_compaction.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/utilities/default_stream.hpp>
@@ -36,15 +39,11 @@
 
 using namespace facebook::velox;
 using namespace facebook::velox::common::testutil;
-using facebook::velox::cudf_velox::connector::hive::iceberg::
+using ::facebook::velox::cudf_velox::connector::hive::iceberg::
     CudfDeletionVectorReader;
 namespace velox_iceberg = ::facebook::velox::connector::hive::iceberg;
 
 namespace {
-
-// ---------------------------------------------------------------------------
-// Bitmap serializers — identical to upstream DeletionVectorReaderTest.cpp.
-// ---------------------------------------------------------------------------
 
 /// Serializes a roaring bitmap in the portable format (no-run variant,
 /// cookie = 12346). Supports only array containers (cardinality <= 4096).
@@ -160,10 +159,6 @@ std::string serializeRoaringBitmapWithRuns(
   return data;
 }
 
-// ---------------------------------------------------------------------------
-// File writer — identical to upstream DeletionVectorReaderTest.cpp.
-// ---------------------------------------------------------------------------
-
 /// Writes binary data to a temp file and returns the path.
 std::shared_ptr<TempFilePath> writeDvFile(const std::string& bitmapData) {
   auto tempFile = TempFilePath::create();
@@ -181,7 +176,7 @@ std::shared_ptr<TempFilePath> writeDvFile(const std::string& bitmapData) {
 // verifying results.
 // ---------------------------------------------------------------------------
 
-/// Creates an IcebergDeleteFile for constructing CudfDeletionVectorReader.
+/// Creates an IcebergDeleteFile for a deletion vector.
 velox_iceberg::IcebergDeleteFile makeDvDeleteFile(
     const std::string& filePath,
     uint64_t fileSize,
@@ -196,7 +191,7 @@ velox_iceberg::IcebergDeleteFile makeDvDeleteFile(
   return velox_iceberg::IcebergDeleteFile(
       velox_iceberg::FileContent::kDeletionVector,
       filePath,
-      dwio::common::FileFormat::UNKNOWN,
+      dwio::common::FileFormat::DWRF,
       1,
       fileSize,
       {},
@@ -204,46 +199,71 @@ velox_iceberg::IcebergDeleteFile makeDvDeleteFile(
       std::move(upperBounds));
 }
 
-/// Extracts the remaining row indices from a filtered cudf table.
+/// Extracts the surviving row positions from a cudf table.
 /// The table must have a single INT64 column containing the original row
-/// indices (used to verify which rows survived deletion).
-std::vector<int64_t> getSurvivorIndices(const cudf::table& table) {
+/// positions.
+std::vector<int64_t> getSurvivingPositions(const cudf::table_view& table) {
   VELOX_CHECK_EQ(table.num_columns(), 1);
-  auto col = table.view().column(0);
-  VELOX_CHECK(col.type().id() == cudf::type_id::INT64);
-  std::vector<int64_t> result(col.size());
-  cudaMemcpy(
-      result.data(),
-      col.data<int64_t>(),
-      col.size() * sizeof(int64_t),
-      cudaMemcpyDeviceToHost);
-  return result;
+  auto index_col = table.column(0);
+  VELOX_CHECK(index_col.type().id() == cudf::type_id::INT64);
+  std::vector<int64_t> host_positions(index_col.size());
+  CUDF_CUDA_TRY(cudaMemcpy(
+      host_positions.data(),
+      index_col.begin<int64_t>(),
+      index_col.size() * sizeof(int64_t),
+      cudaMemcpyDeviceToHost));
+
+  return host_positions;
 }
 
-/// Creates a single-column cudf table of INT64 values [0, numRows).
+/// Creates a single-column cudf table of UINT64 values [0, numRows).
 /// This serves as both the "data" and the row-index tracker: after filtering,
-/// the surviving values tell us exactly which row indices were kept.
+/// the surviving values indicate positions
 std::unique_ptr<cudf::table> makeIndexTable(
-    int64_t numRows,
+    cudf::size_type numRows,
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref mr) {
-  auto buf = rmm::device_buffer(numRows * sizeof(int64_t), stream, mr);
+  auto buffer = rmm::device_buffer(numRows * sizeof(int64_t), stream, mr);
   std::vector<int64_t> hostData(numRows);
   std::iota(hostData.begin(), hostData.end(), int64_t{0});
-  cudaMemcpy(
-      buf.data(),
+  CUDF_CUDA_TRY(cudaMemcpyAsync(
+      buffer.data(),
       hostData.data(),
       numRows * sizeof(int64_t),
-      cudaMemcpyHostToDevice);
-  auto col = std::make_unique<cudf::column>(
-      cudf::data_type{cudf::type_id::INT64},
-      numRows,
-      std::move(buf),
-      rmm::device_buffer{},
-      0);
+      cudaMemcpyHostToDevice));
+
   std::vector<std::unique_ptr<cudf::column>> cols;
-  cols.push_back(std::move(col));
+  cols.push_back(
+      std::make_unique<cudf::column>(
+          cudf::data_type{cudf::type_id::INT64},
+          numRows,
+          std::move(buffer),
+          rmm::device_buffer{},
+          0));
+
   return std::make_unique<cudf::table>(std::move(cols));
+}
+
+/// Creates a boolean mask column of true values.
+std::unique_ptr<cudf::column> makeRowMaskColumn(
+    cudf::size_type numRows,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) {
+  auto true_scalar = cudf::numeric_scalar<bool>(true, true, stream, mr);
+  return cudf::make_column_from_scalar(true_scalar, numRows, stream, mr);
+}
+
+/// Applies the deletion vector to the input table and returns the filtered
+/// table.
+std::unique_ptr<cudf::table> applyDeletionVector(
+    CudfDeletionVectorReader& reader,
+    const std::unique_ptr<cudf::table>& table,
+    int64_t startRow,
+    cudf::mutable_column_view const& rowMask,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) {
+  reader.applyDeletes(rowMask, startRow, table->num_rows(), stream, mr);
+  return cudf::apply_boolean_mask(table->view(), rowMask, stream, mr);
 }
 
 } // namespace
@@ -274,17 +294,17 @@ TEST_F(CudfDeletionVectorReaderTest, basicArrayContainer) {
   auto tempFile = writeDvFile(bitmapData);
   auto fileSize = static_cast<uint64_t>(bitmapData.size());
 
-  auto dvDeleteFile = makeDvDeleteFile(tempFile->getPath(), fileSize);
-  CudfDeletionVectorReader reader(dvDeleteFile);
+  auto dvFile = makeDvDeleteFile(tempFile->getPath(), fileSize);
+  CudfDeletionVectorReader reader(dvFile);
 
-  auto table = makeIndexTable(100, stream_, mr_);
-  auto rowMask =
-      std::make_shared<rmm::device_buffer>(100 * sizeof(bool), stream_, mr_);
-  auto filtered =
-      reader.applyDeletionVector(table->view(), 0, rowMask, stream_, mr_);
+  constexpr auto numRows = 100;
+  auto table = makeIndexTable(numRows, stream_, mr_);
+  auto rowMask = makeRowMaskColumn(numRows, stream_, mr_);
+  auto filtered = applyDeletionVector(
+      reader, table, 0, rowMask->mutable_view(), stream_, mr_);
   stream_.synchronize();
 
-  auto survivors = getSurvivorIndices(*filtered);
+  auto survivors = getSurvivingPositions(filtered->view());
   EXPECT_EQ(filtered->num_rows(), 96);
   std::set<int64_t> deleted(positions.begin(), positions.end());
   for (auto v : survivors) {
@@ -303,11 +323,11 @@ TEST_F(CudfDeletionVectorReaderTest, noDeletesInRange) {
   CudfDeletionVectorReader reader(dvDeleteFile);
 
   // Table has 100 rows; deleted positions 1000/2000 are out of range.
-  auto table = makeIndexTable(100, stream_, mr_);
-  auto rowMask =
-      std::make_shared<rmm::device_buffer>(100 * sizeof(bool), stream_, mr_);
-  auto filtered =
-      reader.applyDeletionVector(table->view(), 0, rowMask, stream_, mr_);
+  constexpr auto numRows = 100;
+  auto table = makeIndexTable(numRows, stream_, mr_);
+  auto rowMask = makeRowMaskColumn(numRows, stream_, mr_);
+  auto filtered = applyDeletionVector(
+      reader, table, 0, rowMask->mutable_view(), stream_, mr_);
   stream_.synchronize();
 
   EXPECT_EQ(filtered->num_rows(), 100);
@@ -326,14 +346,14 @@ TEST_F(CudfDeletionVectorReaderTest, runContainers) {
   auto dvDeleteFile = makeDvDeleteFile(tempFile->getPath(), fileSize);
   CudfDeletionVectorReader reader(dvDeleteFile);
 
-  auto table = makeIndexTable(100, stream_, mr_);
-  auto rowMask =
-      std::make_shared<rmm::device_buffer>(100 * sizeof(bool), stream_, mr_);
-  auto filtered =
-      reader.applyDeletionVector(table->view(), 0, rowMask, stream_, mr_);
+  constexpr auto numRows = 100;
+  auto table = makeIndexTable(numRows, stream_, mr_);
+  auto rowMask = makeRowMaskColumn(numRows, stream_, mr_);
+  auto filtered = applyDeletionVector(
+      reader, table, 0, rowMask->mutable_view(), stream_, mr_);
   stream_.synchronize();
 
-  auto survivors = getSurvivorIndices(*filtered);
+  auto survivors = getSurvivingPositions(filtered->view());
   // Expect positions 10-19 and 50-59 to be deleted (20 positions).
   EXPECT_EQ(filtered->num_rows(), 80);
   std::set<int64_t> deleted;
@@ -359,14 +379,14 @@ TEST_F(CudfDeletionVectorReaderTest, largePositionsMultipleContainers) {
   auto dvDeleteFile = makeDvDeleteFile(tempFile->getPath(), fileSize);
   CudfDeletionVectorReader reader(dvDeleteFile);
 
-  auto table = makeIndexTable(66000, stream_, mr_);
-  auto rowMask =
-      std::make_shared<rmm::device_buffer>(66000 * sizeof(bool), stream_, mr_);
-  auto filtered =
-      reader.applyDeletionVector(table->view(), 0, rowMask, stream_, mr_);
+  constexpr auto numRows = 66000;
+  auto table = makeIndexTable(numRows, stream_, mr_);
+  auto rowMask = makeRowMaskColumn(numRows, stream_, mr_);
+  auto filtered = applyDeletionVector(
+      reader, table, 0, rowMask->mutable_view(), stream_, mr_);
   stream_.synchronize();
 
-  auto survivors = getSurvivorIndices(*filtered);
+  auto survivors = getSurvivingPositions(filtered->view());
   EXPECT_EQ(filtered->num_rows(), 65996);
   std::set<int64_t> deleted(positions.begin(), positions.end());
   for (auto v : survivors) {
@@ -390,14 +410,14 @@ TEST_F(CudfDeletionVectorReaderTest, blobOffset) {
       makeDvDeleteFile(tempFile->getPath(), fileSize, 64, bitmapData.size());
   CudfDeletionVectorReader reader(dvDeleteFile);
 
-  auto table = makeIndexTable(20, stream_, mr_);
-  auto rowMask =
-      std::make_shared<rmm::device_buffer>(20 * sizeof(bool), stream_, mr_);
-  auto filtered =
-      reader.applyDeletionVector(table->view(), 0, rowMask, stream_, mr_);
+  constexpr auto numRows = 20;
+  auto table = makeIndexTable(numRows, stream_, mr_);
+  auto rowMask = makeRowMaskColumn(numRows, stream_, mr_);
+  auto filtered = applyDeletionVector(
+      reader, table, 0, rowMask->mutable_view(), stream_, mr_);
   stream_.synchronize();
 
-  auto survivors = getSurvivorIndices(*filtered);
+  auto survivors = getSurvivingPositions(filtered->view());
   EXPECT_EQ(filtered->num_rows(), 17);
   std::set<int64_t> deleted(positions.begin(), positions.end());
   for (auto v : survivors) {
@@ -414,14 +434,14 @@ TEST_F(CudfDeletionVectorReaderTest, singlePosition) {
   auto dvDeleteFile = makeDvDeleteFile(tempFile->getPath(), fileSize);
   CudfDeletionVectorReader reader(dvDeleteFile);
 
-  auto table = makeIndexTable(100, stream_, mr_);
-  auto rowMask =
-      std::make_shared<rmm::device_buffer>(100 * sizeof(bool), stream_, mr_);
-  auto filtered =
-      reader.applyDeletionVector(table->view(), 0, rowMask, stream_, mr_);
+  constexpr auto numRows = 100;
+  auto table = makeIndexTable(numRows, stream_, mr_);
+  auto rowMask = makeRowMaskColumn(numRows, stream_, mr_);
+  auto filtered = applyDeletionVector(
+      reader, table, 0, rowMask->mutable_view(), stream_, mr_);
   stream_.synchronize();
 
-  auto survivors = getSurvivorIndices(*filtered);
+  auto survivors = getSurvivingPositions(filtered->view());
   EXPECT_EQ(filtered->num_rows(), 99);
   for (auto v : survivors) {
     EXPECT_NE(v, 42) << "Position 42 should be deleted";
@@ -443,14 +463,14 @@ TEST_F(CudfDeletionVectorReaderTest, consecutivePositions) {
   CudfDeletionVectorReader reader(dvDeleteFile);
 
   // Table has 200 rows; first 100 should be deleted.
-  auto table = makeIndexTable(200, stream_, mr_);
-  auto rowMask =
-      std::make_shared<rmm::device_buffer>(200 * sizeof(bool), stream_, mr_);
-  auto filtered =
-      reader.applyDeletionVector(table->view(), 0, rowMask, stream_, mr_);
+  constexpr auto numRows = 200;
+  auto table = makeIndexTable(numRows, stream_, mr_);
+  auto rowMask = makeRowMaskColumn(numRows, stream_, mr_);
+  auto filtered = applyDeletionVector(
+      reader, table, 0, rowMask->mutable_view(), stream_, mr_);
   stream_.synchronize();
 
-  auto survivors = getSurvivorIndices(*filtered);
+  auto survivors = getSurvivingPositions(filtered->view());
   EXPECT_EQ(filtered->num_rows(), 100);
   for (auto v : survivors) {
     EXPECT_GE(v, 100) << "Position " << v << " should be deleted";
@@ -469,17 +489,17 @@ TEST_F(CudfDeletionVectorReaderTest, startRowOffset) {
 
   // Create a 20-row table; startRow=100 means the reader maps row 0 of this
   // chunk to absolute position 100.
-  auto table = makeIndexTable(20, stream_, mr_);
-  auto rowMask =
-      std::make_shared<rmm::device_buffer>(20 * sizeof(bool), stream_, mr_);
-  auto filtered =
-      reader.applyDeletionVector(table->view(), 100, rowMask, stream_, mr_);
+  constexpr auto numRows = 20;
+  auto table = makeIndexTable(numRows, stream_, mr_);
+  auto rowMask = makeRowMaskColumn(numRows, stream_, mr_);
+  auto filtered = applyDeletionVector(
+      reader, table, 100, rowMask->mutable_view(), stream_, mr_);
   stream_.synchronize();
 
   // Rows at absolute positions 100, 105, 110 correspond to chunk indices
   // 0, 5, 10, which should be deleted.
   EXPECT_EQ(filtered->num_rows(), 17);
-  auto survivors = getSurvivorIndices(*filtered);
+  auto survivors = getSurvivingPositions(filtered->view());
   std::set<int64_t> deletedChunkIndices = {0, 5, 10};
   for (auto v : survivors) {
     EXPECT_EQ(deletedChunkIndices.count(v), 0)
@@ -509,12 +529,11 @@ TEST_F(CudfDeletionVectorReaderTest, largeDeletionVector) {
 
   // Apply to a 2000-row table starting at row 0. Only positions in
   // container 0 (key=0, positions 0,64,128,...,65472) overlap with [0,2000).
-  const int64_t numRows = 2000;
+  constexpr int64_t numRows = 2000;
   auto table = makeIndexTable(numRows, stream_, mr_);
-  auto rowMask = std::make_shared<rmm::device_buffer>(
-      numRows * sizeof(bool), stream_, mr_);
-  auto filtered =
-      reader.applyDeletionVector(table->view(), 0, rowMask, stream_, mr_);
+  auto rowMask = makeRowMaskColumn(numRows, stream_, mr_);
+  auto filtered = applyDeletionVector(
+      reader, table, 0, rowMask->mutable_view(), stream_, mr_);
   stream_.synchronize();
 
   // Count expected deletions in [0, 2000): positions 0,64,128,...,1984
@@ -530,7 +549,7 @@ TEST_F(CudfDeletionVectorReaderTest, largeDeletionVector) {
   EXPECT_EQ(expectedDeleted, 32);
   EXPECT_EQ(filtered->num_rows(), numRows - expectedDeleted);
 
-  auto survivors = getSurvivorIndices(*filtered);
+  auto survivors = getSurvivingPositions(filtered->view());
   for (auto v : survivors) {
     EXPECT_EQ(deletedInRange.count(v), 0)
         << "Row " << v << " should have been deleted";

@@ -29,36 +29,26 @@
 
 namespace facebook::velox::cudf_velox::connector::hive::iceberg {
 
-/// Transforms the deletion bitmap to a surviving (boolean) row mask
+/// Applies the deletion bitmap to the current surviving row mask.
 /// @param deviceBitmap Deletion bitmap.
-/// @param rowMask Boolean row mask indicating surviving rows.
+/// @param rowMask Mutable view of row mask column.
 /// @param stream CUDA stream to use for the operation.
 /// @param temp_mr Memory resource for temporary allocations.
-void convertDeletionBitmapToRowMask(
+void applyDeletionBitmapToRowMask(
     cudf::device_span<cudf::bitmask_type const> deviceBitmap,
-    cudf::device_span<bool> rowMask,
+    cudf::mutable_column_view const& rowMask,
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref temp_mr);
 
 /// Scatters deletes to the row mask at positions indicated by `indices`
 /// (anti-join semantics).
-/// @param rowMask The row mask to scatter deletes to.
+/// @param rowMask Mutable view of row mask column.
 /// @param indices The indices to scatter deletes to.
 /// @param stream The stream to use for the operation.
 /// @param temp_mr Memory resource for temporary allocations.
 void scatterDeletesToRowMask(
-    cudf::device_span<bool> rowMask,
+    cudf::mutable_column_view const& rowMask,
     cudf::device_span<cudf::size_type const> indices,
-    rmm::cuda_stream_view stream,
-    rmm::device_async_resource_ref temp_mr);
-
-/// Merges a deletion bitmap into an existing row mask. For each row index,
-/// clears the mask bit if the corresponding bitmap bit is set (deleted).
-/// Unlike convertDeletionBitmapToRowMask which overwrites, this preserves
-/// existing false entries in the mask (AND semantics).
-void mergeDeletionBitmapIntoRowMask(
-    cudf::device_span<cudf::bitmask_type const> deviceBitmap,
-    cudf::device_span<bool> rowMask,
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref temp_mr);
 

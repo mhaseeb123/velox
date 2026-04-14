@@ -14,20 +14,18 @@
  * limitations under the License.
  */
 
-/// End-to-end tests for the cudf Iceberg connector's handling of equality
-/// delete files. Ported from the upstream EqualityDeleteFileReaderTest.
-///
-/// Data files are written as Parquet (via cudf writer) while equality delete
-/// files are written as DWRF (via the upstream velox::dwrf::Writer) since
-/// they are read by the upstream Velox EqualityDeleteFileReader, not cudf.
+/// End-to-end tests for equality deletes via the CudfIcebergSplitReader ported
+/// from the upstream EqualityDeleteFileReaderTest.
+/// These tests write DWRF and Parquet data files and DWRF delete files, then
+/// execute table scans verifying that matching rows are filtered out.
 
+#include "velox/experimental/cudf/connectors/hive/iceberg/CudfDeletionVectorReader.h"
 #include "velox/experimental/cudf/connectors/hive/iceberg/tests/CudfIcebergTestBase.h"
 
 #include "velox/common/file/FileSystems.h"
 #include "velox/common/testutil/TempFilePath.h"
 #include "velox/connectors/hive/iceberg/IcebergDeleteFile.h"
 #include "velox/connectors/hive/iceberg/IcebergMetadataColumns.h"
-#include "velox/experimental/cudf/connectors/hive/iceberg/CudfDeletionVectorReader.h"
 #include "velox/exec/tests/utils/AssertQueryBuilder.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
 
@@ -109,16 +107,26 @@ IcebergDeleteFile makeDvDeleteFile(
     const std::string& filePath,
     uint64_t fileSize,
     int64_t recordCount,
+    uint64_t blobOffset = 0,
+    std::optional<uint64_t> blobLength = std::nullopt,
     int64_t dataSequenceNumber = 0) {
   std::unordered_map<int32_t, std::string> lowerBounds;
   std::unordered_map<int32_t, std::string> upperBounds;
-  lowerBounds[CudfDeletionVectorReader::kDvOffsetFieldId] = "0";
-  upperBounds[CudfDeletionVectorReader::kDvLengthFieldId] =
-      std::to_string(fileSize);
+
+  lowerBounds[CudfDeletionVectorReader::kDvOffsetFieldId] =
+      std::to_string(blobOffset);
+  if (blobLength.has_value()) {
+    upperBounds[CudfDeletionVectorReader::kDvLengthFieldId] =
+        std::to_string(blobLength.value());
+  } else {
+    upperBounds[CudfDeletionVectorReader::kDvLengthFieldId] =
+        std::to_string(fileSize);
+  }
+
   return IcebergDeleteFile(
       FileContent::kDeletionVector,
       filePath,
-      facebook::velox::dwio::common::FileFormat::UNKNOWN,
+      facebook::velox::dwio::common::FileFormat::DWRF,
       recordCount,
       fileSize,
       {},
@@ -793,8 +801,7 @@ TEST_F(CudfIcebergGapTests, insertDeleteInsertInterleaving) {
   allSplits.insert(allSplits.end(), splits2.begin(), splits2.end());
 
   auto plan = makeTableScanPlan(rowType);
-  auto result =
-      AssertQueryBuilder(plan).splits(allSplits).copyResults(pool());
+  auto result = AssertQueryBuilder(plan).splits(allSplits).copyResults(pool());
 
   // File1 loses c0=2, file2 keeps c0=2
   auto expected = makeRowVector({
@@ -871,10 +878,12 @@ TEST_F(CudfIcebergGapTests, multipleDeletesAtDifferentSequenceNumbers) {
   // File 1 (seq=1): both del1(seq=2) and del2(seq=4) apply -> c0=2 deleted
   auto splits1 = makeIcebergSplits(
       dataFile1->getPath(), {icebergDel1, icebergDel2}, {}, 1, 1);
-  // File 2 (seq=3): del1(seq=2) skipped (2<3), del2(seq=4) applies -> c0=2 deleted
+  // File 2 (seq=3): del1(seq=2) skipped (2<3), del2(seq=4) applies -> c0=2
+  // deleted
   auto splits2 = makeIcebergSplits(
       dataFile2->getPath(), {icebergDel1, icebergDel2}, {}, 1, 3);
-  // File 3 (seq=5): del1(seq=2) skipped, del2(seq=4) skipped (4<5) -> c0=2 survives
+  // File 3 (seq=5): del1(seq=2) skipped, del2(seq=4) skipped (4<5) -> c0=2
+  // survives
   auto splits3 = makeIcebergSplits(
       dataFile3->getPath(), {icebergDel1, icebergDel2}, {}, 1, 5);
 
@@ -954,8 +963,8 @@ TEST_F(CudfIcebergGapTests, positionalAndEqualityWithSequenceNumbers) {
       /*dataSequenceNumber=*/3);
 
   // Data seq=1: both deletes apply (seq=2>=1, seq=3>1)
-  auto splits = makeIcebergSplits(
-      dataFile->getPath(), {posDelete, eqDelete}, {}, 1, 1);
+  auto splits =
+      makeIcebergSplits(dataFile->getPath(), {posDelete, eqDelete}, {}, 1, 1);
 
   auto plan = makeTableScanPlan(rowType);
   auto result = AssertQueryBuilder(plan).splits(splits).copyResults(pool());
@@ -1067,8 +1076,7 @@ TEST_F(CudfIcebergGapTests, hivePartitionedTable) {
   folly::SingletonVault::singleton()->registrationComplete();
 
   // Table schema: c0 (data), c1 (data), country (partition)
-  auto fullType =
-      ROW({"c0", "c1", "country"}, {BIGINT(), BIGINT(), VARCHAR()});
+  auto fullType = ROW({"c0", "c1", "country"}, {BIGINT(), BIGINT(), VARCHAR()});
 
   // Data file only contains c0, c1 (partition column is NOT in parquet)
   auto baseData = makeRowVector({
@@ -1113,8 +1121,7 @@ TEST_F(CudfIcebergGapTests, hivePartitionedTable) {
 TEST_F(CudfIcebergGapTests, hivePartitionWithEqualityDelete) {
   folly::SingletonVault::singleton()->registrationComplete();
 
-  auto fullType =
-      ROW({"c0", "c1", "region"}, {BIGINT(), BIGINT(), VARCHAR()});
+  auto fullType = ROW({"c0", "c1", "region"}, {BIGINT(), BIGINT(), VARCHAR()});
   auto dataColumns = ROW({"c0", "c1"}, {BIGINT(), BIGINT()});
 
   auto baseData = makeRowVector({
@@ -1141,8 +1148,8 @@ TEST_F(CudfIcebergGapTests, hivePartitionWithEqualityDelete) {
       {"region", "APAC"},
   };
 
-  auto splits = makeIcebergSplits(
-      dataFile->getPath(), {eqDelete}, partitionKeys);
+  auto splits =
+      makeIcebergSplits(dataFile->getPath(), {eqDelete}, partitionKeys);
 
   auto plan = PlanBuilder()
                   .startTableScan()
@@ -1373,8 +1380,7 @@ TEST_F(CudfIcebergGapTests, multipleEqualityDeletesDifferentKeyColumns) {
       getFileSize(eqDelFile2->getPath()),
       /*equalityFieldIds=*/{2});
 
-  auto splits =
-      makeIcebergSplits(dataFile->getPath(), {eqDelete1, eqDelete2});
+  auto splits = makeIcebergSplits(dataFile->getPath(), {eqDelete1, eqDelete2});
   auto plan = makeTableScanPlan(rowType);
   auto result = AssertQueryBuilder(plan).splits(splits).copyResults(pool());
 
@@ -1407,8 +1413,7 @@ TEST_F(CudfIcebergGapTests, allRowsDeletedContinuesReading) {
   writeToFile(dataFile2->getPath(), data2);
 
   // Delete c0 = {1, 2, 3, 4} — kills all of file 1 and one row of file 2
-  auto eqDel =
-      makeRowVector({makeFlatVector<int64_t>({1, 2, 3, 4})});
+  auto eqDel = makeRowVector({makeFlatVector<int64_t>({1, 2, 3, 4})});
   auto eqDelFile = TempFilePath::create();
   writeDeleteFile(DeleteFileFormat::PARQUET, eqDelFile->getPath(), {eqDel});
 
@@ -1688,7 +1693,7 @@ TEST_F(CudfIcebergGapTests, deletionVectorPlusEqualityDelete) {
   auto bitmapData = serializeDvBitmap({0, 7});
   auto dvFile = writeDvToFile(bitmapData);
   auto dvDelete = makeDvDeleteFile(
-      dvFile->getPath(), bitmapData.size(), 2, /*dataSequenceNumber=*/2);
+      dvFile->getPath(), bitmapData.size(), 2, 0, {}, /*dataSequenceNumber=*/2);
 
   // Equality delete: delete c0=30, c0=60
   auto eqDel = makeRowVector({makeFlatVector<int64_t>({30, 60})});
@@ -1741,7 +1746,7 @@ TEST_F(CudfIcebergGapTests, deletionVectorPlusPositionalDelete) {
   auto bitmapData = serializeDvBitmap({0, 5});
   auto dvFile = writeDvToFile(bitmapData);
   auto dvDelete = makeDvDeleteFile(
-      dvFile->getPath(), bitmapData.size(), 2, /*dataSequenceNumber=*/2);
+      dvFile->getPath(), bitmapData.size(), 2, 0, {}, /*dataSequenceNumber=*/2);
 
   // Positional delete: delete position 2 (c0=30)
   auto pathColumn = IcebergMetadataColumn::icebergDeleteFilePathColumn();
