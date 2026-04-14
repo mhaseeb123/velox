@@ -30,7 +30,6 @@
 #include "velox/exec/tests/utils/PlanBuilder.h"
 
 #include <folly/Random.h>
-#include <folly/Singleton.h>
 #include <folly/String.h>
 
 using namespace facebook::velox::exec::test;
@@ -271,9 +270,7 @@ class CudfIcebergReadTest : public CudfIcebergTestBase {
       }
 
       writeDeleteFile(
-          DeleteFileFormat::DWRF,
-          deleteFilePath->getPath(),
-          deleteFileVectors);
+          DeleteFileFormat::DWRF, deleteFilePath->getPath(), deleteFileVectors);
 
       deleteFilePaths[deleteFileName] =
           std::make_pair(totalPositionsInDeleteFile, deleteFilePath);
@@ -391,8 +388,6 @@ class CudfIcebergReadTest : public CudfIcebergTestBase {
 
 /// Basic read without any deletes.
 TEST_F(CudfIcebergReadTest, basicRead) {
-  folly::SingletonVault::singleton()->registrationComplete();
-
   auto rowType = ROW({"c0"}, {BIGINT()});
   auto data = makeRowVector({makeFlatVector<int64_t>({0, 1, 2, 3, 4})});
 
@@ -423,8 +418,6 @@ TEST_F(CudfIcebergReadTest, basicRead) {
 
 /// Read with multiple columns.
 TEST_F(CudfIcebergReadTest, multiColumn) {
-  folly::SingletonVault::singleton()->registrationComplete();
-
   auto rowType = ROW({"c0", "c1"}, {BIGINT(), DOUBLE()});
   auto data = makeRowVector({
       makeFlatVector<int64_t>({10, 20, 30}),
@@ -452,8 +445,6 @@ TEST_F(CudfIcebergReadTest, multiColumn) {
 
 /// Read a larger file to verify chunked reading works.
 TEST_F(CudfIcebergReadTest, largerFile) {
-  folly::SingletonVault::singleton()->registrationComplete();
-
   auto rowType = ROW({"c0"}, {BIGINT()});
   auto values = makeContinuousIncreasingValues(0, 10000);
   auto data = makeRowVector({makeFlatVector<int64_t>(values)});
@@ -477,8 +468,6 @@ TEST_F(CudfIcebergReadTest, largerFile) {
 
 /// Read with an empty split (no delete files).
 TEST_F(CudfIcebergReadTest, noDeleteFiles) {
-  folly::SingletonVault::singleton()->registrationComplete();
-
   auto rowType = ROW({"c0"}, {BIGINT()});
   auto data = makeRowVector({makeFlatVector<int64_t>({100, 200, 300})});
 
@@ -500,8 +489,6 @@ TEST_F(CudfIcebergReadTest, noDeleteFiles) {
 
 /// Read with multiple data files (multiple splits).
 TEST_F(CudfIcebergReadTest, multipleSplits) {
-  folly::SingletonVault::singleton()->registrationComplete();
-
   auto rowType = ROW({"c0"}, {BIGINT()});
 
   auto data1 = makeRowVector({makeFlatVector<int64_t>({1, 2, 3})});
@@ -533,8 +520,6 @@ TEST_F(CudfIcebergReadTest, multipleSplits) {
 }
 
 TEST_F(CudfIcebergReadTest, singleBaseFileSinglePositionalDeleteFile) {
-  folly::SingletonVault::singleton()->registrationComplete();
-
   assertSingleBaseFileSingleDeleteFile({{0, 1, 2, 3}});
   assertSingleBaseFileSingleDeleteFile({{0, 9999, 10000, 19999}});
   assertSingleBaseFileSingleDeleteFile({{10000, 10002, 19999}});
@@ -546,8 +531,6 @@ TEST_F(CudfIcebergReadTest, singleBaseFileSinglePositionalDeleteFile) {
 }
 
 TEST_F(CudfIcebergReadTest, multipleBaseFilesSinglePositionalDeleteFile) {
-  folly::SingletonVault::singleton()->registrationComplete();
-
   assertMultipleBaseFileSingleDeleteFile({0, 1, 2, 3});
   assertMultipleBaseFileSingleDeleteFile({0, 9999, 10000, 19999});
   assertMultipleBaseFileSingleDeleteFile({10000, 10002, 19999});
@@ -560,8 +543,6 @@ TEST_F(CudfIcebergReadTest, multipleBaseFilesSinglePositionalDeleteFile) {
 }
 
 TEST_F(CudfIcebergReadTest, singleBaseFileMultiplePositionalDeleteFiles) {
-  folly::SingletonVault::singleton()->registrationComplete();
-
   assertSingleBaseFileMultipleDeleteFiles({{1}, {2}, {3}, {4}});
   assertSingleBaseFileMultipleDeleteFiles({{0}, {9999}, {10000}, {19999}});
   assertSingleBaseFileMultipleDeleteFiles({{500, 21000}});
@@ -587,8 +568,6 @@ TEST_F(CudfIcebergReadTest, singleBaseFileMultiplePositionalDeleteFiles) {
 }
 
 TEST_F(CudfIcebergReadTest, multipleBaseFileMultiplePositionalDeleteFiles) {
-  folly::SingletonVault::singleton()->registrationComplete();
-
   std::map<std::string, std::vector<int64_t>> rowGroupSizesForFiles;
   std::unordered_map<
       std::string,
@@ -654,7 +633,6 @@ TEST_F(CudfIcebergReadTest, multipleBaseFileMultiplePositionalDeleteFiles) {
 // TODO(mh): This test assumes the file is chunked across multiple splits.
 #if 0
 TEST_F(CudfIcebergReadTest, positionalDeletesMultipleSplits) {
-  folly::SingletonVault::singleton()->registrationComplete();
 
   assertMultipleSplits({1, 2, 3, 4}, 10, 5);
   assertMultipleSplits({1, 2, 3, 4}, 10, 0);
@@ -681,8 +659,6 @@ TEST_F(CudfIcebergReadTest, positionalDeletesMultipleSplits) {
 #endif
 
 TEST_F(CudfIcebergReadTest, positionalDeleteSequenceNumberApplied) {
-  folly::SingletonVault::singleton()->registrationComplete();
-
   auto pathColumn = IcebergMetadataColumn::icebergDeleteFilePathColumn();
   auto posColumn = IcebergMetadataColumn::icebergDeletePosColumn();
   auto rowType = ROW({"c0"}, {BIGINT()});
@@ -735,8 +711,6 @@ TEST_F(CudfIcebergReadTest, positionalDeleteSequenceNumberApplied) {
 }
 
 TEST_F(CudfIcebergReadTest, positionalDeleteSequenceNumberSkipped) {
-  folly::SingletonVault::singleton()->registrationComplete();
-
   auto pathColumn = IcebergMetadataColumn::icebergDeleteFilePathColumn();
   auto posColumn = IcebergMetadataColumn::icebergDeletePosColumn();
   auto rowType = ROW({"c0"}, {BIGINT()});
@@ -789,8 +763,6 @@ TEST_F(CudfIcebergReadTest, positionalDeleteSequenceNumberSkipped) {
 }
 
 TEST_F(CudfIcebergReadTest, positionalDeleteSequenceNumberEqualApplied) {
-  folly::SingletonVault::singleton()->registrationComplete();
-
   auto pathColumn = IcebergMetadataColumn::icebergDeleteFilePathColumn();
   auto posColumn = IcebergMetadataColumn::icebergDeletePosColumn();
   auto rowType = ROW({"c0"}, {BIGINT()});
@@ -843,8 +815,6 @@ TEST_F(CudfIcebergReadTest, positionalDeleteSequenceNumberEqualApplied) {
 }
 
 TEST_F(CudfIcebergReadTest, positionalDeleteSequenceNumberZeroDisablesFilter) {
-  folly::SingletonVault::singleton()->registrationComplete();
-
   auto pathColumn = IcebergMetadataColumn::icebergDeleteFilePathColumn();
   auto posColumn = IcebergMetadataColumn::icebergDeletePosColumn();
   auto rowType = ROW({"c0"}, {BIGINT()});
@@ -902,8 +872,6 @@ TEST_F(CudfIcebergReadTest, positionalDeleteSequenceNumberZeroDisablesFilter) {
 /// Verifies that positional deletes (position-based) and equality deletes
 /// (value-based) compose correctly when applied sequentially.
 TEST_F(CudfIcebergReadTest, combinedPositionalAndEqualityDeletes) {
-  folly::SingletonVault::singleton()->registrationComplete();
-
   auto rowType = ROW({"c0", "c1"}, {BIGINT(), BIGINT()});
 
   auto baseData = makeRowVector({
@@ -969,8 +937,6 @@ TEST_F(CudfIcebergReadTest, combinedPositionalAndEqualityDeletes) {
 /// Query selects only c1, but equality delete key is c0.
 /// The reader must force-project c0 for filtering then strip it from output.
 TEST_F(CudfIcebergReadTest, nonProjectedDeleteKeyColumn) {
-  folly::SingletonVault::singleton()->registrationComplete();
-
   auto fullType = ROW({"c0", "c1"}, {BIGINT(), BIGINT()});
   auto outputType = ROW({"c1"}, {BIGINT()});
 
@@ -1020,8 +986,6 @@ TEST_F(CudfIcebergReadTest, nonProjectedDeleteKeyColumn) {
 /// Insert-delete-insert interleaving: data written after a delete (higher
 /// sequence number) should NOT be affected by that delete.
 TEST_F(CudfIcebergReadTest, insertDeleteInsertInterleaving) {
-  folly::SingletonVault::singleton()->registrationComplete();
-
   auto rowType = ROW({"c0", "c1"}, {BIGINT(), BIGINT()});
 
   // File 1: original data (seq=1)

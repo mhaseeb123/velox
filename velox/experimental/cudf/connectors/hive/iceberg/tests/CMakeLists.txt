@@ -32,6 +32,7 @@ add_executable(
   Main.cpp
   CudfIcebergReadTest.cpp
   CudfEqualityDeleteFileReaderTest.cpp
+  CudfIcebergGapTests.cpp
 )
 
 target_link_libraries(
