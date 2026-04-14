@@ -201,14 +201,15 @@ velox_iceberg::IcebergDeleteFile makeDvDeleteFile(
 }
 
 /// Extracts which positions from [0, totalRows) were deleted (i.e. are NOT
-/// present in the filtered table). Returns a sorted vector, analogous to
-/// upstream's getSetBits().
-std::vector<int64_t> getDeletedPositions(
+/// present in the filtered table)
+std::vector<int64_t> getSetBits(
     const cudf::table_view& filtered,
     int64_t totalRows) {
   VELOX_CHECK_EQ(filtered.num_columns(), 1);
+
   auto index_col = filtered.column(0);
   VELOX_CHECK(index_col.type().id() == cudf::type_id::INT64);
+
   std::vector<int64_t> survivors(index_col.size());
   CUDF_CUDA_TRY(cudaMemcpy(
       survivors.data(),
@@ -216,14 +217,14 @@ std::vector<int64_t> getDeletedPositions(
       index_col.size() * sizeof(int64_t),
       cudaMemcpyDeviceToHost));
 
-  std::set<int64_t> survivorSet(survivors.begin(), survivors.end());
-  std::vector<int64_t> deleted;
+  std::set<int64_t> unsetBits(survivors.begin(), survivors.end());
+  std::vector<int64_t> setBits;
   for (int64_t i = 0; i < totalRows; ++i) {
-    if (survivorSet.count(i) == 0) {
-      deleted.push_back(i);
+    if (unsetBits.count(i) == 0) {
+      setBits.push_back(i);
     }
   }
-  return deleted;
+  return setBits;
 }
 
 /// Creates a single-column cudf table of UINT64 values [0, numRows).
@@ -311,7 +312,7 @@ TEST_F(CudfDeletionVectorReaderTest, basicArrayContainer) {
       reader, table, 0, rowMask->mutable_view(), stream_, mr_);
   stream_.synchronize();
 
-  auto deleted = getDeletedPositions(filtered->view(), numRows);
+  auto deleted = getSetBits(filtered->view(), numRows);
   EXPECT_EQ(deleted, (std::vector<int64_t>{0, 5, 10, 99}));
 }
 
@@ -333,7 +334,7 @@ TEST_F(CudfDeletionVectorReaderTest, noDeletesInRange) {
       reader, table, 0, rowMask->mutable_view(), stream_, mr_);
   stream_.synchronize();
 
-  auto deleted = getDeletedPositions(filtered->view(), numRows);
+  auto deleted = getSetBits(filtered->view(), numRows);
   EXPECT_TRUE(deleted.empty());
 }
 
@@ -357,7 +358,7 @@ TEST_F(CudfDeletionVectorReaderTest, runContainers) {
       reader, table, 0, rowMask->mutable_view(), stream_, mr_);
   stream_.synchronize();
 
-  auto deleted = getDeletedPositions(filtered->view(), numRows);
+  auto deleted = getSetBits(filtered->view(), numRows);
   // Expect positions 10-19 and 50-59 to be deleted.
   std::vector<int64_t> expected;
   for (int64_t i = 10; i <= 19; ++i) {
@@ -387,7 +388,7 @@ TEST_F(CudfDeletionVectorReaderTest, largePositionsMultipleContainers) {
       reader, table, 0, rowMask->mutable_view(), stream_, mr_);
   stream_.synchronize();
 
-  auto deleted = getDeletedPositions(filtered->view(), numRows);
+  auto deleted = getSetBits(filtered->view(), numRows);
   EXPECT_EQ(deleted, (std::vector<int64_t>{5, 100, 65536, 65600}));
 }
 
@@ -414,7 +415,7 @@ TEST_F(CudfDeletionVectorReaderTest, blobOffset) {
       reader, table, 0, rowMask->mutable_view(), stream_, mr_);
   stream_.synchronize();
 
-  auto deleted = getDeletedPositions(filtered->view(), numRows);
+  auto deleted = getSetBits(filtered->view(), numRows);
   EXPECT_EQ(deleted, (std::vector<int64_t>{3, 7, 11}));
 }
 
@@ -434,7 +435,7 @@ TEST_F(CudfDeletionVectorReaderTest, singlePosition) {
       reader, table, 0, rowMask->mutable_view(), stream_, mr_);
   stream_.synchronize();
 
-  auto deleted = getDeletedPositions(filtered->view(), numRows);
+  auto deleted = getSetBits(filtered->view(), numRows);
   EXPECT_EQ(deleted, (std::vector<int64_t>{42}));
 }
 
@@ -460,7 +461,7 @@ TEST_F(CudfDeletionVectorReaderTest, consecutivePositions) {
       reader, table, 0, rowMask->mutable_view(), stream_, mr_);
   stream_.synchronize();
 
-  auto deleted = getDeletedPositions(filtered->view(), numRows);
+  auto deleted = getSetBits(filtered->view(), numRows);
   std::vector<int64_t> expected;
   expected.reserve(100);
   for (int64_t i = 0; i < 100; ++i) {
@@ -490,7 +491,7 @@ TEST_F(CudfDeletionVectorReaderTest, startRowOffset) {
 
   // Rows at absolute positions 100, 105, 110 correspond to chunk indices
   // 0, 5, 10, which should be deleted.
-  auto deleted = getDeletedPositions(filtered->view(), numRows);
+  auto deleted = getSetBits(filtered->view(), numRows);
   EXPECT_EQ(deleted, (std::vector<int64_t>{0, 5, 10}));
 }
 
@@ -523,7 +524,7 @@ TEST_F(CudfDeletionVectorReaderTest, largeDeletionVector) {
       reader, table, 0, rowMask->mutable_view(), stream_, mr_);
   stream_.synchronize();
 
-  auto deleted = getDeletedPositions(filtered->view(), numRows);
+  auto deleted = getSetBits(filtered->view(), numRows);
   // Only positions in container 0 overlap [0, 2000): 0, 64, 128, ..., 1984.
   std::vector<int64_t> expected;
   for (int64_t i = 0; i < numRows; i += 64) {
