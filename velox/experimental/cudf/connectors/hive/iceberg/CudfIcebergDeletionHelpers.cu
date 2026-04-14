@@ -45,7 +45,7 @@ struct IsSurvivingRow {
 } // namespace
 
 void applyDeletionBitmapToRowMask(
-    cudf::device_span<cudf::bitmask_type const> deviceBitmap,
+    cudf::device_span<const cudf::bitmask_type> deviceBitmap,
     cudf::mutable_column_view const& rowMask,
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref temp_mr) {
@@ -62,7 +62,7 @@ void applyDeletionBitmapToRowMask(
 
 void scatterDeletesToRowMask(
     cudf::mutable_column_view const& rowMask,
-    cudf::device_span<cudf::size_type const> indices,
+    cudf::device_span<const cudf::size_type> indices,
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref temp_mr) {
   // Alternate: Use `cudf::scatter` but it produces a new column.
