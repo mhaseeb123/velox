@@ -199,21 +199,30 @@ velox_iceberg::IcebergDeleteFile makeDvDeleteFile(
       std::move(upperBounds));
 }
 
-/// Extracts the surviving row positions from a cudf table.
-/// The table must have a single INT64 column containing the original row
-/// positions.
-std::vector<int64_t> getSurvivingPositions(const cudf::table_view& table) {
-  VELOX_CHECK_EQ(table.num_columns(), 1);
-  auto index_col = table.column(0);
+/// Extracts which positions from [0, totalRows) were deleted (i.e. are NOT
+/// present in the filtered table). Returns a sorted vector, analogous to
+/// upstream's getSetBits().
+std::vector<int64_t> getDeletedPositions(
+    const cudf::table_view& filtered,
+    int64_t totalRows) {
+  VELOX_CHECK_EQ(filtered.num_columns(), 1);
+  auto index_col = filtered.column(0);
   VELOX_CHECK(index_col.type().id() == cudf::type_id::INT64);
-  std::vector<int64_t> host_positions(index_col.size());
+  std::vector<int64_t> survivors(index_col.size());
   CUDF_CUDA_TRY(cudaMemcpy(
-      host_positions.data(),
+      survivors.data(),
       index_col.begin<int64_t>(),
       index_col.size() * sizeof(int64_t),
       cudaMemcpyDeviceToHost));
 
-  return host_positions;
+  std::set<int64_t> survivorSet(survivors.begin(), survivors.end());
+  std::vector<int64_t> deleted;
+  for (int64_t i = 0; i < totalRows; ++i) {
+    if (survivorSet.count(i) == 0) {
+      deleted.push_back(i);
+    }
+  }
+  return deleted;
 }
 
 /// Creates a single-column cudf table of UINT64 values [0, numRows).
@@ -304,12 +313,8 @@ TEST_F(CudfDeletionVectorReaderTest, basicArrayContainer) {
       reader, table, 0, rowMask->mutable_view(), stream_, mr_);
   stream_.synchronize();
 
-  auto survivors = getSurvivingPositions(filtered->view());
-  EXPECT_EQ(filtered->num_rows(), 96);
-  std::set<int64_t> deleted(positions.begin(), positions.end());
-  for (auto v : survivors) {
-    EXPECT_EQ(deleted.count(v), 0) << "Position " << v << " should be deleted";
-  }
+  auto deleted = getDeletedPositions(filtered->view(), numRows);
+  EXPECT_EQ(deleted, (std::vector<int64_t>{0, 5, 10, 99}));
 }
 
 TEST_F(CudfDeletionVectorReaderTest, noDeletesInRange) {
@@ -319,8 +324,8 @@ TEST_F(CudfDeletionVectorReaderTest, noDeletesInRange) {
   auto tempFile = writeDvFile(bitmapData);
   auto fileSize = static_cast<uint64_t>(bitmapData.size());
 
-  auto dvDeleteFile = makeDvDeleteFile(tempFile->getPath(), fileSize);
-  CudfDeletionVectorReader reader(dvDeleteFile);
+  auto dvFile = makeDvDeleteFile(tempFile->getPath(), fileSize);
+  CudfDeletionVectorReader reader(dvFile);
 
   // Table has 100 rows; deleted positions 1000/2000 are out of range.
   constexpr auto numRows = 100;
@@ -330,7 +335,8 @@ TEST_F(CudfDeletionVectorReaderTest, noDeletesInRange) {
       reader, table, 0, rowMask->mutable_view(), stream_, mr_);
   stream_.synchronize();
 
-  EXPECT_EQ(filtered->num_rows(), 100);
+  auto deleted = getDeletedPositions(filtered->view(), numRows);
+  EXPECT_TRUE(deleted.empty());
 }
 
 TEST_F(CudfDeletionVectorReaderTest, runContainers) {
@@ -343,8 +349,8 @@ TEST_F(CudfDeletionVectorReaderTest, runContainers) {
   auto tempFile = writeDvFile(bitmapData);
   auto fileSize = static_cast<uint64_t>(bitmapData.size());
 
-  auto dvDeleteFile = makeDvDeleteFile(tempFile->getPath(), fileSize);
-  CudfDeletionVectorReader reader(dvDeleteFile);
+  auto dvFile = makeDvDeleteFile(tempFile->getPath(), fileSize);
+  CudfDeletionVectorReader reader(dvFile);
 
   constexpr auto numRows = 100;
   auto table = makeIndexTable(numRows, stream_, mr_);
@@ -353,19 +359,16 @@ TEST_F(CudfDeletionVectorReaderTest, runContainers) {
       reader, table, 0, rowMask->mutable_view(), stream_, mr_);
   stream_.synchronize();
 
-  auto survivors = getSurvivingPositions(filtered->view());
-  // Expect positions 10-19 and 50-59 to be deleted (20 positions).
-  EXPECT_EQ(filtered->num_rows(), 80);
-  std::set<int64_t> deleted;
+  auto deleted = getDeletedPositions(filtered->view(), numRows);
+  // Expect positions 10-19 and 50-59 to be deleted.
+  std::vector<int64_t> expected;
   for (int64_t i = 10; i <= 19; ++i) {
-    deleted.insert(i);
+    expected.push_back(i);
   }
   for (int64_t i = 50; i <= 59; ++i) {
-    deleted.insert(i);
+    expected.push_back(i);
   }
-  for (auto v : survivors) {
-    EXPECT_EQ(deleted.count(v), 0) << "Position " << v << " should be deleted";
-  }
+  EXPECT_EQ(deleted, expected);
 }
 
 TEST_F(CudfDeletionVectorReaderTest, largePositionsMultipleContainers) {
@@ -376,8 +379,8 @@ TEST_F(CudfDeletionVectorReaderTest, largePositionsMultipleContainers) {
   auto tempFile = writeDvFile(bitmapData);
   auto fileSize = static_cast<uint64_t>(bitmapData.size());
 
-  auto dvDeleteFile = makeDvDeleteFile(tempFile->getPath(), fileSize);
-  CudfDeletionVectorReader reader(dvDeleteFile);
+  auto dvFile = makeDvDeleteFile(tempFile->getPath(), fileSize);
+  CudfDeletionVectorReader reader(dvFile);
 
   constexpr auto numRows = 66000;
   auto table = makeIndexTable(numRows, stream_, mr_);
@@ -386,12 +389,8 @@ TEST_F(CudfDeletionVectorReaderTest, largePositionsMultipleContainers) {
       reader, table, 0, rowMask->mutable_view(), stream_, mr_);
   stream_.synchronize();
 
-  auto survivors = getSurvivingPositions(filtered->view());
-  EXPECT_EQ(filtered->num_rows(), 65996);
-  std::set<int64_t> deleted(positions.begin(), positions.end());
-  for (auto v : survivors) {
-    EXPECT_EQ(deleted.count(v), 0) << "Position " << v << " should be deleted";
-  }
+  auto deleted = getDeletedPositions(filtered->view(), numRows);
+  EXPECT_EQ(deleted, (std::vector<int64_t>{5, 100, 65536, 65600}));
 }
 
 TEST_F(CudfDeletionVectorReaderTest, blobOffset) {
@@ -406,9 +405,9 @@ TEST_F(CudfDeletionVectorReaderTest, blobOffset) {
   auto tempFile = writeDvFile(fileContent);
   auto fileSize = static_cast<uint64_t>(fileContent.size());
 
-  auto dvDeleteFile =
+  auto dvFile =
       makeDvDeleteFile(tempFile->getPath(), fileSize, 64, bitmapData.size());
-  CudfDeletionVectorReader reader(dvDeleteFile);
+  CudfDeletionVectorReader reader(dvFile);
 
   constexpr auto numRows = 20;
   auto table = makeIndexTable(numRows, stream_, mr_);
@@ -417,12 +416,8 @@ TEST_F(CudfDeletionVectorReaderTest, blobOffset) {
       reader, table, 0, rowMask->mutable_view(), stream_, mr_);
   stream_.synchronize();
 
-  auto survivors = getSurvivingPositions(filtered->view());
-  EXPECT_EQ(filtered->num_rows(), 17);
-  std::set<int64_t> deleted(positions.begin(), positions.end());
-  for (auto v : survivors) {
-    EXPECT_EQ(deleted.count(v), 0) << "Position " << v << " should be deleted";
-  }
+  auto deleted = getDeletedPositions(filtered->view(), numRows);
+  EXPECT_EQ(deleted, (std::vector<int64_t>{3, 7, 11}));
 }
 
 TEST_F(CudfDeletionVectorReaderTest, singlePosition) {
@@ -431,8 +426,8 @@ TEST_F(CudfDeletionVectorReaderTest, singlePosition) {
   auto tempFile = writeDvFile(bitmapData);
   auto fileSize = static_cast<uint64_t>(bitmapData.size());
 
-  auto dvDeleteFile = makeDvDeleteFile(tempFile->getPath(), fileSize);
-  CudfDeletionVectorReader reader(dvDeleteFile);
+  auto dvFile = makeDvDeleteFile(tempFile->getPath(), fileSize);
+  CudfDeletionVectorReader reader(dvFile);
 
   constexpr auto numRows = 100;
   auto table = makeIndexTable(numRows, stream_, mr_);
@@ -441,11 +436,8 @@ TEST_F(CudfDeletionVectorReaderTest, singlePosition) {
       reader, table, 0, rowMask->mutable_view(), stream_, mr_);
   stream_.synchronize();
 
-  auto survivors = getSurvivingPositions(filtered->view());
-  EXPECT_EQ(filtered->num_rows(), 99);
-  for (auto v : survivors) {
-    EXPECT_NE(v, 42) << "Position 42 should be deleted";
-  }
+  auto deleted = getDeletedPositions(filtered->view(), numRows);
+  EXPECT_EQ(deleted, (std::vector<int64_t>{42}));
 }
 
 TEST_F(CudfDeletionVectorReaderTest, consecutivePositions) {
@@ -459,8 +451,8 @@ TEST_F(CudfDeletionVectorReaderTest, consecutivePositions) {
   auto tempFile = writeDvFile(bitmapData);
   auto fileSize = static_cast<uint64_t>(bitmapData.size());
 
-  auto dvDeleteFile = makeDvDeleteFile(tempFile->getPath(), fileSize);
-  CudfDeletionVectorReader reader(dvDeleteFile);
+  auto dvFile = makeDvDeleteFile(tempFile->getPath(), fileSize);
+  CudfDeletionVectorReader reader(dvFile);
 
   // Table has 200 rows; first 100 should be deleted.
   constexpr auto numRows = 200;
@@ -470,11 +462,13 @@ TEST_F(CudfDeletionVectorReaderTest, consecutivePositions) {
       reader, table, 0, rowMask->mutable_view(), stream_, mr_);
   stream_.synchronize();
 
-  auto survivors = getSurvivingPositions(filtered->view());
-  EXPECT_EQ(filtered->num_rows(), 100);
-  for (auto v : survivors) {
-    EXPECT_GE(v, 100) << "Position " << v << " should be deleted";
+  auto deleted = getDeletedPositions(filtered->view(), numRows);
+  std::vector<int64_t> expected;
+  expected.reserve(100);
+  for (int64_t i = 0; i < 100; ++i) {
+    expected.push_back(i);
   }
+  EXPECT_EQ(deleted, expected);
 }
 
 TEST_F(CudfDeletionVectorReaderTest, startRowOffset) {
@@ -484,8 +478,8 @@ TEST_F(CudfDeletionVectorReaderTest, startRowOffset) {
   auto tempFile = writeDvFile(bitmapData);
   auto fileSize = static_cast<uint64_t>(bitmapData.size());
 
-  auto dvDeleteFile = makeDvDeleteFile(tempFile->getPath(), fileSize);
-  CudfDeletionVectorReader reader(dvDeleteFile);
+  auto dvFile = makeDvDeleteFile(tempFile->getPath(), fileSize);
+  CudfDeletionVectorReader reader(dvFile);
 
   // Create a 20-row table; startRow=100 means the reader maps row 0 of this
   // chunk to absolute position 100.
@@ -498,13 +492,8 @@ TEST_F(CudfDeletionVectorReaderTest, startRowOffset) {
 
   // Rows at absolute positions 100, 105, 110 correspond to chunk indices
   // 0, 5, 10, which should be deleted.
-  EXPECT_EQ(filtered->num_rows(), 17);
-  auto survivors = getSurvivingPositions(filtered->view());
-  std::set<int64_t> deletedChunkIndices = {0, 5, 10};
-  for (auto v : survivors) {
-    EXPECT_EQ(deletedChunkIndices.count(v), 0)
-        << "Chunk index " << v << " should be deleted";
-  }
+  auto deleted = getDeletedPositions(filtered->view(), numRows);
+  EXPECT_EQ(deleted, (std::vector<int64_t>{0, 5, 10}));
 }
 
 TEST_F(CudfDeletionVectorReaderTest, largeDeletionVector) {
@@ -524,8 +513,8 @@ TEST_F(CudfDeletionVectorReaderTest, largeDeletionVector) {
   auto tempFile = writeDvFile(bitmapData);
   auto fileSize = static_cast<uint64_t>(bitmapData.size());
 
-  auto dvDeleteFile = makeDvDeleteFile(tempFile->getPath(), fileSize);
-  CudfDeletionVectorReader reader(dvDeleteFile);
+  auto dvFile = makeDvDeleteFile(tempFile->getPath(), fileSize);
+  CudfDeletionVectorReader reader(dvFile);
 
   // Apply to a 2000-row table starting at row 0. Only positions in
   // container 0 (key=0, positions 0,64,128,...,65472) overlap with [0,2000).
@@ -536,24 +525,13 @@ TEST_F(CudfDeletionVectorReaderTest, largeDeletionVector) {
       reader, table, 0, rowMask->mutable_view(), stream_, mr_);
   stream_.synchronize();
 
-  // Count expected deletions in [0, 2000): positions 0,64,128,...,1984
-  int64_t expectedDeleted = 0;
-  std::set<int64_t> deletedInRange;
-  for (auto pos : positions) {
-    if (pos < numRows) {
-      ++expectedDeleted;
-      deletedInRange.insert(pos);
-    }
+  auto deleted = getDeletedPositions(filtered->view(), numRows);
+  // Only positions in container 0 overlap [0, 2000): 0, 64, 128, ..., 1984.
+  std::vector<int64_t> expected;
+  for (int64_t i = 0; i < numRows; i += 64) {
+    expected.push_back(i);
   }
-  // 0, 64, 128, ..., 1984 → ceil(2000/64) = 32 deleted
-  EXPECT_EQ(expectedDeleted, 32);
-  EXPECT_EQ(filtered->num_rows(), numRows - expectedDeleted);
-
-  auto survivors = getSurvivingPositions(filtered->view());
-  for (auto v : survivors) {
-    EXPECT_EQ(deletedInRange.count(v), 0)
-        << "Row " << v << " should have been deleted";
-  }
+  EXPECT_EQ(deleted, expected);
 }
 
 // ---------------------------------------------------------------------------
