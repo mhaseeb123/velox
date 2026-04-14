@@ -505,8 +505,9 @@ TEST_F(CudfDeletionVectorReaderTest, largeDeletionVector) {
   // Use 5 containers (high keys 0-4) with ~1024 positions each.
   using IndexType = int64_t;
   std::vector<IndexType> positions;
-  for (int key = 0; key < 5; ++key) {
-    int64_t base = static_cast<int64_t>(key) * 65536;
+  positions.reserve(5 * 1024);
+  for (IndexType key = 0; key < 5; ++key) {
+    IndexType base = key * 65536;
     for (int i = 0; i < 1024; ++i) {
       positions.push_back(base + i * 64); // every 64th value
     }
