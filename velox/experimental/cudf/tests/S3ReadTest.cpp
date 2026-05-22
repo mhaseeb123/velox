@@ -32,11 +32,67 @@
 #include <folly/init/Init.h>
 #include <gtest/gtest.h>
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include <chrono>
+#include <cstdlib>
+#include <thread>
+
 using namespace facebook::velox::exec::test;
 using namespace facebook::velox::cudf_velox::exec::test;
 namespace {
 
-class S3ReadTest : public S3Test, public ::test::VectorTestBase {
+// Environment variables used by KvikIO/libcurl to reach an S3-compatible
+// endpoint. They are exported in SetUp() (for the KvikIO parameter) and
+// cleared in TearDown() so the test does not leak state to the rest of the
+// process.
+constexpr const char* kAwsEnvVars[] = {
+    "AWS_ENDPOINT_URL",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_DEFAULT_REGION",
+};
+
+// Block until a TCP connection to `host:port` can be established or the
+// timeout expires. KvikIO fails fast on connection-refused (it does not retry
+// network errors), so we have to make sure MinIO is actually accepting
+// connections before the test issues any S3 request through KvikIO.
+bool waitForTcpListening(
+    const std::string& host,
+    uint16_t port,
+    std::chrono::milliseconds timeout) {
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  while (std::chrono::steady_clock::now() < deadline) {
+    int sock = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) {
+      return false;
+    }
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    if (::inet_pton(AF_INET, host.c_str(), &addr.sin_addr) != 1) {
+      ::close(sock);
+      return false;
+    }
+    const int rc =
+        ::connect(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+    ::close(sock);
+    if (rc == 0) {
+      return true;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+  return false;
+}
+
+// Parameterized on whether cuDF hive connector uses  BufferedInput (true) or
+// falls back to KvikIO (false)
+class S3ReadTest : public S3Test,
+                   public ::test::VectorTestBase,
+                   public ::testing::WithParamInterface<bool> {
  protected:
   static void SetUpTestCase() {
     memory::MemoryManager::testingSetInstance(memory::MemoryManager::Options{});
@@ -50,10 +106,44 @@ class S3ReadTest : public S3Test, public ::test::VectorTestBase {
     filesystems::registerS3FileSystem();
 
     // Register Hive connector
+    auto hiveConfig = minioServer_->hiveConfig({
+        {facebook::velox::cudf_velox::connector::hive::CudfHiveConfig::
+             kUseBufferedInput,
+         GetParam() ? "true" : "false"},
+    });
+
+    // KvikIO source uses libcurl + AWS SigV4, ignore Velox's S3 configuration. Point it at the test MinIO server via standard AWS env vars.
+    if (!GetParam()) {
+      const auto endpoint =
+          hiveConfig->get<std::string>("hive.s3.endpoint").value();
+      const auto accessKey =
+          hiveConfig->get<std::string>("hive.s3.aws-access-key").value();
+      const auto secretKey =
+          hiveConfig->get<std::string>("hive.s3.aws-secret-key").value();
+      const auto endpointUrl = "http://" + endpoint;
+      ::setenv("AWS_ENDPOINT_URL", endpointUrl.c_str(), /*overwrite=*/1);
+      ::setenv("AWS_ACCESS_KEY_ID", accessKey.c_str(), /*overwrite=*/1);
+      ::setenv("AWS_SECRET_ACCESS_KEY", secretKey.c_str(), /*overwrite=*/1);
+      ::setenv("AWS_DEFAULT_REGION", "us-east-1", /*overwrite=*/1);
+
+      // KvikIO does not retry on connection-refused, so block until MinIO is
+      // actually accepting connections before any S3 request is issued.
+      const auto colon = endpoint.find(':');
+      VELOX_CHECK_NE(
+          colon, std::string::npos, "Unexpected MinIO endpoint: {}", endpoint);
+      const auto host = endpoint.substr(0, colon);
+      const auto port = static_cast<uint16_t>(
+          std::stoi(endpoint.substr(colon + 1)));
+      VELOX_CHECK(
+          waitForTcpListening(host, port, std::chrono::seconds(30)),
+          "MinIO server at {} did not accept connections within 30s",
+          endpoint);
+    }
+
     facebook::velox::cudf_velox::connector::hive::CudfHiveConnectorFactory
         factory;
     auto hiveConnector = factory.newConnector(
-        kCudfHiveConnectorId, minioServer_->hiveConfig(), ioExecutor_.get());
+        kCudfHiveConnectorId, std::move(hiveConfig), ioExecutor_.get());
     facebook::velox::connector::ConnectorRegistry::global().insert(
         hiveConnector->connectorId(), hiveConnector);
   }
@@ -62,12 +152,17 @@ class S3ReadTest : public S3Test, public ::test::VectorTestBase {
     filesystems::finalizeS3FileSystem();
     facebook::velox::connector::ConnectorRegistry::global().erase(
         kCudfHiveConnectorId);
+    if (!GetParam()) {
+      for (const auto* var : kAwsEnvVars) {
+        ::unsetenv(var);
+      }
+    }
     S3Test::TearDown();
   }
 };
 } // namespace
 
-TEST_F(S3ReadTest, s3ReadTest) {
+TEST_P(S3ReadTest, s3ReadTest) {
   const auto sourceFile = test::getDataFilePath(
       "velox/experimental/cudf/tests",
       "../../../dwio/parquet/tests/examples/int.parquet");
@@ -112,3 +207,11 @@ TEST_F(S3ReadTest, s3ReadTest) {
            kExpectedRows, [](auto row) { return row + 1000; })});
   assertEqualResults({expectedResults}, {copy});
 }
+
+INSTANTIATE_TEST_SUITE_P(
+    S3ReadTestSuite,
+    S3ReadTest,
+    ::testing::Values(true, false),
+    [](const ::testing::TestParamInfo<bool>& info) {
+      return info.param ? "BufferedInput" : "KvikIO";
+    });
