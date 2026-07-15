@@ -26,3 +26,20 @@ target_link_libraries(
   Thrust::Thrust
   CUDA::cudart
 )
+
+if(TARGET velox_gpu_synthetic_benchmark)
+  add_executable(
+    velox_gpu_synthetic_benchmark_test
+    SyntheticBenchmarkTest.cpp
+  )
+  target_link_libraries(
+    velox_gpu_synthetic_benchmark_test
+    velox_gpu_synthetic_benchmark
+    GTest::gtest
+    GTest::gtest_main
+  )
+  add_test(
+    velox_gpu_synthetic_benchmark_test
+    velox_gpu_synthetic_benchmark_test
+  )
+endif()

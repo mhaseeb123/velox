@@ -124,6 +124,12 @@ RowVectorPtr CudfFromVelox::doGetOutput() {
     return nullptr;
   }
 
+  if (auto cudfInput = std::dynamic_pointer_cast<CudfVector>(inputs_.front())) {
+    currentOutputSize_ -= cudfInput->size();
+    inputs_.erase(inputs_.begin());
+    return cudfInput;
+  }
+
   // Select inputs that don't exceed the max vector size limit
   std::vector<RowVectorPtr> selectedInputs;
   vector_size_t totalSize = 0;

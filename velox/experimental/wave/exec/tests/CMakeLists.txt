@@ -61,6 +61,10 @@ set_tests_properties(velox_wave_exec_test PROPERTIES LABELS cuda_driver)
 
 if(${VELOX_ENABLE_BENCHMARKS})
   add_executable(velox_wave_benchmark WaveBenchmark.cpp)
+  add_executable(
+    velox_wave_synthetic_benchmark
+    SyntheticWaveBenchmark.cpp
+  )
 
   target_link_libraries(
     velox_wave_benchmark
@@ -91,6 +95,28 @@ if(${VELOX_ENABLE_BENCHMARKS})
     GTest::gmock
     Folly::folly
     Folly::follybenchmark
+    gflags::gflags
+    glog::glog
+    fmt::fmt
+    CUDA::cudart
+  )
+
+  target_link_libraries(
+    velox_wave_synthetic_benchmark
+    velox_gpu_synthetic_benchmark
+    velox_query_benchmark
+    velox_wave_exec
+    velox_wave_mock_reader
+    velox_aggregates
+    velox_exec
+    velox_exec_test_lib
+    velox_functions_lib
+    velox_functions_prestosql
+    velox_hive_connector
+    velox_memory
+    velox_test_util
+    velox_vector
+    Folly::folly
     gflags::gflags
     glog::glog
     fmt::fmt

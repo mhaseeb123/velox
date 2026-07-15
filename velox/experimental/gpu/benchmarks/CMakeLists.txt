@@ -12,10 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-if(${VELOX_ENABLE_BENCHMARKS})
-  add_subdirectory(benchmarks)
-endif()
+add_library(velox_gpu_synthetic_benchmark SyntheticBenchmark.cpp)
 
-if(${VELOX_BUILD_TESTING})
-  add_subdirectory(tests)
-endif()
+target_link_libraries(
+  velox_gpu_synthetic_benchmark
+  velox_exec_test_lib
+  velox_vector_test_lib
+  Folly::folly
+  fmt::fmt
+)

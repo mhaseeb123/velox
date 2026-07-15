@@ -47,3 +47,22 @@ target_link_libraries(
   Folly::folly
   Folly::follybenchmark
 )
+
+add_executable(
+  velox_cudf_synthetic_benchmark
+  CudfSyntheticBenchmark.cpp
+)
+
+target_link_libraries(
+  velox_cudf_synthetic_benchmark
+  velox_gpu_synthetic_benchmark
+  velox_cudf_exec
+  velox_cudf_exec_test_lib
+  velox_exec_test_lib
+  velox_functions_prestosql
+  velox_memory
+  velox_vector
+  Folly::folly
+  gflags::gflags
+  glog::glog
+)
