@@ -295,6 +295,7 @@ void ensureInit() {
     headers = program._impl->_config->sources;
     saveSystemHeaders(headers);
   }
+  headers.try_emplace("climits", "#include <cuda/std/climits>\n");
   initializeWaveHeaders(headers, "sample");
 
   for (auto& str : waveNvrtcFlags) {
