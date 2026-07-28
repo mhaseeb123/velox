@@ -15,8 +15,10 @@
  */
 
 #include "velox/experimental/cudf/expression/CommonFunctions.h"
+#include "velox/experimental/cudf/expression/DateTruncFunction.h"
 #include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
 #include "velox/experimental/cudf/expression/PrestoFunctions.h"
+#include "velox/experimental/cudf/expression/prestosql/DateAddFunction.h"
 #include "velox/experimental/cudf/expression/prestosql/DatePlusIntervalFunction.h"
 
 #include "velox/common/base/Exceptions.h"
@@ -28,6 +30,7 @@
 #include <cudf/strings/slice.hpp>
 
 #include <memory>
+#include <optional>
 
 namespace facebook::velox::cudf_velox {
 namespace {
@@ -100,12 +103,11 @@ class SubstrFunction : public CudfFunction {
       rmm::cuda_stream_view stream,
       rmm::device_async_resource_ref mr) const override {
     auto inputCol = asView(inputColumns[0]);
-    cudf::numeric_scalar<cudf::size_type> startScalar(start_, true, stream, mr);
-    cudf::numeric_scalar<cudf::size_type> endScalar(
-        hasEnd_ ? end_ : 0, hasEnd_, stream, mr);
-    cudf::numeric_scalar<cudf::size_type> stepScalar(1, true, stream, mr);
-    return cudf::strings::slice_strings(
-        inputCol, startScalar, endScalar, stepScalar, stream, mr);
+    const auto start = std::optional<cudf::size_type>{start_};
+    const auto end =
+        hasEnd_ ? std::optional<cudf::size_type>{end_} : std::nullopt;
+    const auto step = std::optional<cudf::size_type>{1};
+    return cudf::strings::slice_strings(inputCol, start, end, step, stream, mr);
   }
 
  private:
@@ -148,6 +150,38 @@ void registerPrestoFunctions(const std::string& prefix) {
            .argumentType("date")
            .argumentType("interval day to second")
            .build()});
+
+  registerCudfFunction(
+      prefix + "date_add",
+      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
+        return std::make_shared<prestosql::DateAddFunction>(expr);
+      },
+      {FunctionSignatureBuilder()
+           .returnType("date")
+           .constantArgumentType("varchar")
+           .argumentType("bigint")
+           .argumentType("date")
+           .build()},
+      true,
+      prestosql::DateAddFunction::canEvaluate);
+
+  registerCudfFunction(
+      prefix + "date_trunc",
+      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
+        return std::make_shared<DateTruncFunction>(expr);
+      },
+      {FunctionSignatureBuilder()
+           .returnType("timestamp")
+           .constantArgumentType("varchar")
+           .argumentType("timestamp")
+           .build(),
+       FunctionSignatureBuilder()
+           .returnType("date")
+           .constantArgumentType("varchar")
+           .argumentType("date")
+           .build()},
+      true,
+      DateTruncFunction::canEvaluate);
 }
 
 } // namespace facebook::velox::cudf_velox
