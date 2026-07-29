@@ -55,7 +55,7 @@ class ParquetReaderTest : public ParquetTestBase {
   dwio::common::ReaderOptions makeThriftTrackingReaderOptions() {
     auto readerOptions = makeDefaultReaderOptions();
     auto parquetOptions = std::make_shared<ParquetReaderOptions>();
-    parquetOptions->footerMemoryTrackingThreshold = 1;
+    parquetOptions->setFooterMemoryTrackingThreshold(1);
     readerOptions.setFormatSpecificOptions(std::move(parquetOptions));
     return readerOptions;
   }
@@ -63,13 +63,10 @@ class ParquetReaderTest : public ParquetTestBase {
 
 TEST_F(ParquetReaderTest, createFormatOptions) {
   config::ConfigBase connectorConfig({
-      {std::string(ParquetConfig::kUseColumnNames), "true"},
-      {std::string(ParquetConfig::kFooterSpeculativeIoSize), "99"},
       {std::string(ParquetConfig::kAllowInt32Narrowing), "false"},
       {std::string(ParquetConfig::kFooterMemoryTrackingThreshold), "99"},
   });
   config::ConfigBase session({
-      {std::string(ParquetConfig::kFooterSpeculativeIoSizeSession), "2"},
       {std::string(ParquetConfig::kAllowInt32NarrowingSession), "true"},
       {std::string(ParquetConfig::kFooterMemoryTrackingThresholdSession), "1"},
   });
@@ -77,10 +74,8 @@ TEST_F(ParquetReaderTest, createFormatOptions) {
   ParquetReaderFactory factory;
   auto parquetOptions = checkedPointerCast<ParquetReaderOptions>(
       factory.createFormatOptions(connectorConfig, session));
-  EXPECT_EQ(parquetOptions->columnMappingMode, ColumnMappingMode::kName);
-  EXPECT_EQ(parquetOptions->footerSpeculativeIoSize, 2);
-  EXPECT_TRUE(parquetOptions->allowInt32Narrowing);
-  EXPECT_EQ(parquetOptions->footerMemoryTrackingThreshold, 1);
+  EXPECT_TRUE(parquetOptions->allowInt32Narrowing());
+  EXPECT_EQ(parquetOptions->footerMemoryTrackingThreshold(), 1);
 }
 
 TEST_F(ParquetReaderTest, parseSample) {
@@ -1655,6 +1650,78 @@ TEST_F(ParquetReaderTest, readerWithSchema) {
   ParquetReader reader(std::move(buffer), readerOptions);
 
   EXPECT_EQ(reader.rowType()->toString(), schema->toString());
+}
+
+// Test that loadFileMetaData rejects a Parquet trailer whose 4-byte
+// footerLength is near UINT32_MAX. The validation footerLength + 12 must be
+// computed in 64-bit; a 32-bit computation wraps to a tiny value that passes
+// the file-length check and drives an out-of-bounds read while reassembling
+// the footer.
+TEST_F(ParquetReaderTest, corruptFooterLengthWraps) {
+  // Trailer layout: [padding][4-byte footerLength][PAR1]. Choosing a
+  // footerLength close to UINT32_MAX makes footerLength + 12 wrap to 4 in
+  // 32-bit arithmetic, which trivially satisfies the wrapped guard.
+  std::string dataBuf(8, '\0');
+  const uint32_t corruptFooterLength = 0xFFFFFFF8;
+  dataBuf.append(
+      reinterpret_cast<const char*>(&corruptFooterLength), sizeof(uint32_t));
+  dataBuf.append("PAR1");
+
+  auto readerOptions = makeDefaultReaderOptions();
+  auto file = std::make_shared<InMemoryReadFile>(std::move(dataBuf));
+  auto buffer = std::make_unique<dwio::common::BufferedInput>(
+      file, readerOptions.memoryPool());
+
+  VELOX_ASSERT_THROW(
+      ParquetReader(std::move(buffer), readerOptions),
+      "is inconsistent with file length");
+}
+
+// Regression test for the BooleanDecoder dense fast path. A dense read whose
+// row count is not a multiple of 8 must preserve the unread bits of the
+// current byte so a subsequent read resumes at the correct bit. Reading a
+// plain-encoded boolean page in two dense chunks split at row 3 (a
+// non-multiple of 8) previously dropped the remaining 5 bits of the first
+// byte and misaligned every following value.
+TEST_F(ParquetReaderTest, booleanDenseReadSplitAcrossByte) {
+  const auto rowType = ROW({"b"}, {BOOLEAN()});
+  // 40 rows span 5 encoded bytes; the pattern is non-periodic over a byte so
+  // a misaligned resume produces observably wrong values.
+  constexpr int32_t kNumRows = 40;
+  auto values = makeFlatVector<bool>(
+      kNumRows, [](auto row) { return (row % 3) == 0 || (row % 7) == 0; });
+  auto data = makeRowVector({"b"}, {values});
+
+  auto* sink = write(data);
+  auto readerBundle = readerBuilder(*sink, rowType).build();
+  ASSERT_EQ(readerBundle.reader->numberOfRows(), kNumRows);
+
+  auto& rowReader = *readerBundle.rowReader;
+  auto result = BaseVector::create(rowType, 0, leafPool_.get());
+
+  // First dense chunk: 3 rows, ending mid first byte (non-multiple of 8).
+  ASSERT_EQ(rowReader.next(3, result), 3);
+  {
+    auto* flat = result->as<RowVector>()
+                     ->childAt(0)
+                     ->loadedVector()
+                     ->asFlatVector<bool>();
+    for (int32_t i = 0; i < 3; ++i) {
+      EXPECT_EQ(flat->valueAt(i), values->valueAt(i)) << "row " << i;
+    }
+  }
+
+  // Second dense chunk: the remaining rows must resume at row 3.
+  ASSERT_EQ(rowReader.next(kNumRows, result), kNumRows - 3);
+  {
+    auto* flat = result->as<RowVector>()
+                     ->childAt(0)
+                     ->loadedVector()
+                     ->asFlatVector<bool>();
+    for (int32_t i = 0; i < kNumRows - 3; ++i) {
+      EXPECT_EQ(flat->valueAt(i), values->valueAt(i + 3)) << "row " << (i + 3);
+    }
+  }
 }
 
 TEST_F(ParquetReaderTest, columnStatistics) {
