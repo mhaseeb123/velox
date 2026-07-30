@@ -61,6 +61,12 @@ class WaveHiveDataSource : public WaveDataSource {
 
   std::unordered_map<std::string, RuntimeMetric> getRuntimeStats() override;
 
+  /// Makes every Hive DataSource able to produce a WaveDataSource. Call this
+  /// to run Wave over a normally registered Hive connector. Idempotent.
+  static void registerWaveDelegate();
+
+  /// Registers the delegate and additionally creates the "wavemock" Hive
+  /// connector used by the mock format tests and benchmarks.
   static void registerConnector();
 
  private:

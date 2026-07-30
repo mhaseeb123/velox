@@ -12,12 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-add_subdirectory(decode)
+add_library(velox_wave_parquet_reader WaveParquetSplitReader.cpp)
 
-add_library(velox_wave_dwio ColumnReader.cpp FormatData.cpp ReadStream.cpp StructColumnReader.cpp)
-
-target_link_libraries(velox_wave_dwio Folly::folly fmt::fmt xsimd)
-
-if(${VELOX_ENABLE_PARQUET})
-  add_subdirectory(parquet)
-endif()
+target_link_libraries(
+  velox_wave_parquet_reader
+  velox_wave_exec
+  velox_dwio_parquet_reader
+  velox_hive_connector
+  Folly::folly
+  fmt::fmt
+)

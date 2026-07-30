@@ -23,6 +23,11 @@ add_executable(
   Main.cpp
 )
 
+if(${VELOX_ENABLE_PARQUET})
+  target_sources(velox_wave_exec_test PRIVATE ParquetTableScanTest.cpp)
+  target_link_libraries(velox_wave_exec_test velox_wave_parquet_reader)
+endif()
+
 target_link_libraries(
   velox_wave_exec_test
   velox_wave_exec

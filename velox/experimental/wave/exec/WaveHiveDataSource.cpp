@@ -160,6 +160,8 @@ void WaveHiveDataSource::registerConnector() {
     return;
   }
   registered = true;
+  registerWaveDelegate();
+
   auto config = std::make_shared<const config::ConfigBase>(
       std::unordered_map<std::string, std::string>());
 
@@ -168,6 +170,15 @@ void WaveHiveDataSource::registerConnector() {
   auto hiveConnector = factory.newConnector("wavemock", config, nullptr);
   connector::ConnectorRegistry::global().insert(
       hiveConnector->connectorId(), hiveConnector);
+}
+
+// static
+void WaveHiveDataSource::registerWaveDelegate() {
+  static bool registered = false;
+  if (registered) {
+    return;
+  }
+  registered = true;
   connector::hive::HiveDataSource::registerWaveDelegateHook(
       [](const HiveTableHandlePtr& hiveTableHandle,
          const std::shared_ptr<common::ScanSpec>& scanSpec,
