@@ -112,7 +112,7 @@ RowVectorPtr executeWorkload(
   return result;
 }
 
-core::PlanNodePtr makeWavePlan(
+core::PlanNodePtr makeWaveMockPlan(
     Workload workload,
     memory::MemoryPool* pool,
     const DataSet& data,
@@ -161,32 +161,52 @@ Result runBenchmark(memory::MemoryPool* pool) {
       .batchRows = FLAGS_synthetic_batch_rows,
       .filterPercent = FLAGS_synthetic_filter_percent,
       .groupCardinality = FLAGS_synthetic_group_cardinality};
+  const bool parquetInput = gpu::benchmark::parquetInputRequested();
+
+  // Stage 1. The CPU Parquet read has to finish before registerWave() installs
+  // its global driver adapter, otherwise the scan itself would be routed to
+  // Wave, which has no Parquet split reader.
+  gpu::benchmark::ScannedInput scanned;
+  if (parquetInput) {
+    scanned = gpu::benchmark::prepareParquetInput(options, workload, pool);
+  }
 
   uint64_t expectedChecksum = 0;
   if (FLAGS_synthetic_cpu_validation) {
-    auto validationData =
-        gpu::benchmark::makeDataForWorkload(pool, options, workload);
+    auto validationData = parquetInput
+        ? scanned.data
+        : gpu::benchmark::makeDataForWorkload(pool, options, workload);
     auto expectedPlan =
         gpu::benchmark::makeValuesPlan(workload, pool, validationData, options);
     expectedChecksum = gpu::benchmark::resultChecksum(
         executeWorkload(workload, expectedPlan, {}, pool, false));
   }
 
+  // Stage 2. GPU compute over host vectors that are already in memory.
   const auto coldStart = std::chrono::steady_clock::now();
-  auto data = gpu::benchmark::makeDataForWorkload(pool, options, workload);
+  auto data = parquetInput
+      ? scanned.data
+      : gpu::benchmark::makeDataForWorkload(pool, options, workload);
   registerWave();
-  WaveHiveDataSource::registerConnector();
-  test::WaveTestSplitReader::registerTestSplitReader();
-  exec::ExchangeSource::factories().clear();
-  exec::ExchangeSource::registerFactory(exec::test::createLocalExchangeSource);
   test::SplitVector splits;
-  if (workload != Workload::kJoinAggregate && workload != Workload::kQ3) {
-    test::Table::dropTable("synthetic_benchmark");
-    splits =
-        test::Table::defineTable("synthetic_benchmark", data.fact)->splits();
+  core::PlanNodePtr plan;
+  if (parquetInput) {
+    plan = gpu::benchmark::makeValuesPlan(workload, pool, data, options);
+  } else {
+    WaveHiveDataSource::registerConnector();
+    test::WaveTestSplitReader::registerTestSplitReader();
+    exec::ExchangeSource::factories().clear();
+    exec::ExchangeSource::registerFactory(exec::test::createLocalExchangeSource);
+    if (!gpu::benchmark::workloadNeedsOrders(workload)) {
+      test::Table::dropTable("synthetic_benchmark");
+      splits =
+          test::Table::defineTable("synthetic_benchmark", data.fact)->splits();
+    }
+    plan = makeWaveMockPlan(workload, pool, data, options);
   }
-  auto plan = makeWavePlan(workload, pool, data, options);
-  auto coldResult = executeWorkload(workload, plan, splits, pool, true);
+  const bool useMockPostJoin = !parquetInput;
+  auto coldResult =
+      executeWorkload(workload, plan, splits, pool, useMockPostJoin);
   const auto coldMs = elapsedMs(coldStart);
   const auto checksum = gpu::benchmark::resultChecksum(coldResult);
   if (!FLAGS_synthetic_cpu_validation) {
@@ -195,19 +215,19 @@ Result runBenchmark(memory::MemoryPool* pool) {
   VELOX_CHECK_EQ(checksum, expectedChecksum);
 
   for (int32_t i = 0; i < FLAGS_synthetic_warmups; ++i) {
-    executeWorkload(workload, plan, splits, pool, true);
+    executeWorkload(workload, plan, splits, pool, useMockPostJoin);
   }
 
   std::vector<double> samples;
   samples.reserve(FLAGS_synthetic_repetitions);
   for (int32_t i = 0; i < FLAGS_synthetic_repetitions; ++i) {
     const auto start = std::chrono::steady_clock::now();
-    auto result = executeWorkload(workload, plan, splits, pool, true);
+    auto result = executeWorkload(workload, plan, splits, pool, useMockPostJoin);
     samples.push_back(elapsedMs(start));
     VELOX_CHECK_EQ(gpu::benchmark::resultChecksum(result), expectedChecksum);
   }
 
-  return Result{
+  Result result{
       .backend = "wave",
       .workload = gpu::benchmark::workloadName(workload),
       .rows = options.rows,
@@ -220,6 +240,12 @@ Result runBenchmark(memory::MemoryPool* pool) {
       .expectedChecksum = expectedChecksum,
       .coldMs = coldMs,
       .warmMs = std::move(samples)};
+  if (parquetInput) {
+    gpu::benchmark::applyScannedInput(scanned, data.fact, result);
+  } else {
+    gpu::benchmark::recordBatchShape(data.fact, result);
+  }
+  return result;
 }
 
 } // namespace

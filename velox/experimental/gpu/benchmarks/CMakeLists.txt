@@ -21,3 +21,12 @@ target_link_libraries(
   Folly::folly
   fmt::fmt
 )
+
+if(VELOX_ENABLE_PARQUET)
+  target_link_libraries(
+    velox_gpu_synthetic_benchmark
+    velox_dwio_parquet_reader
+    velox_dwio_parquet_writer
+    velox_hive_connector
+  )
+endif()
